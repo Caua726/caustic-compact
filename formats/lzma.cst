@@ -1,0 +1,314 @@
+// =======================================================
+// caustic-compact/formats/lzma.cst
+// LZMA decoder — binary range coder + the full LZMA state machine
+// (literals with match-byte context, normal/rep matches, length and
+// distance decoders). Faithful port of the LZMA reference decoder.
+// Entry point: lzma_alone_decompress() for the 13-byte ".lzma" header.
+// The core (lzma_init/lzma_rc_init/lzma_run) is reused by formats/lzma2.cst.
+//   lzma_alone_decompress(src, src_len, out) -> bytes written, or -err.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "std/mem.cst" only bins, core as mem;
+
+struct Lzma {
+    lc as i64; lp as i64; pb as i64; numPosStates as i64;
+    probs as *i64; nprobs as i64;
+    // probability-group offsets into probs[]
+    o_isMatch as i64; o_isRep as i64; o_isRepG0 as i64; o_isRepG1 as i64;
+    o_isRepG2 as i64; o_isRep0Long as i64; o_posSlot as i64; o_specPos as i64;
+    o_align as i64; o_lenChoice as i64; o_lenChoice2 as i64; o_lenLow as i64;
+    o_lenMid as i64; o_lenHigh as i64; o_repChoice as i64; o_repChoice2 as i64;
+    o_repLow as i64; o_repMid as i64; o_repHigh as i64; o_literal as i64;
+    // range decoder
+    code as i64; range as i64; src as *u8; pos as i64; srclen as i64;
+    // sequence state
+    state as i64; rep0 as i64; rep1 as i64; rep2 as i64; rep3 as i64;
+    dictStart as i64;   // output offset of the current dictionary (LZMA2 reset)
+}
+
+// Allocate the probability model for props byte = (pb*5 + lp)*9 + lc.
+// Returns 0 ok, or Z_BADHDR / Z_OOM. Caller may reuse the struct across
+// LZMA2 chunks; props reset reallocates only when lc/lp/pb change.
+fn lzma_init(lz as *Lzma, props as i64) as i64 {
+    if (props >= 225) { return errno.Z_BADHDR; }
+    lz.lc = props % 9;
+    let is i64 as r = props / 9;
+    lz.lp = r % 5;
+    lz.pb = r / 5;
+    lz.numPosStates = 1 << lz.pb;
+
+    let is i64 as off with mut = 0;
+    lz.o_isMatch = off;    off = off + (12 << 4);
+    lz.o_isRep = off;      off = off + 12;
+    lz.o_isRepG0 = off;    off = off + 12;
+    lz.o_isRepG1 = off;    off = off + 12;
+    lz.o_isRepG2 = off;    off = off + 12;
+    lz.o_isRep0Long = off; off = off + (12 << 4);
+    lz.o_posSlot = off;    off = off + (4 << 6);
+    lz.o_specPos = off;    off = off + 115;
+    lz.o_align = off;      off = off + 16;
+    lz.o_lenChoice = off;  off = off + 1;
+    lz.o_lenChoice2 = off; off = off + 1;
+    lz.o_lenLow = off;     off = off + (lz.numPosStates << 3);
+    lz.o_lenMid = off;     off = off + (lz.numPosStates << 3);
+    lz.o_lenHigh = off;    off = off + 256;
+    lz.o_repChoice = off;  off = off + 1;
+    lz.o_repChoice2 = off; off = off + 1;
+    lz.o_repLow = off;     off = off + (lz.numPosStates << 3);
+    lz.o_repMid = off;     off = off + (lz.numPosStates << 3);
+    lz.o_repHigh = off;    off = off + 256;
+    lz.o_literal = off;    off = off + (0x300 << (lz.lc + lz.lp));
+    lz.nprobs = off;
+
+    lz.probs = cast(*i64, mem.core.mmap_anon(off * 8));
+    if (cast(i64, lz.probs) <= 0) { return errno.Z_OOM; }
+    return 0;
+}
+
+// Reset all probabilities to the midpoint (1024) and the sequence state.
+fn lzma_reset_probs(lz as *Lzma) as void {
+    let is i64 as i with mut = 0;
+    while (i < lz.nprobs) { lz.probs[i] = 1024; i = i + 1; }
+    lz.state = 0; lz.rep0 = 0; lz.rep1 = 0; lz.rep2 = 0; lz.rep3 = 0;
+}
+
+// Initialize the range decoder at byte offset `at` (skips one byte, loads 4).
+fn lzma_rc_init(lz as *Lzma, src as *u8, src_len as i64, at as i64) as void {
+    lz.src = src; lz.srclen = src_len;
+    lz.pos = at + 1;                       // first byte is ignored (must be 0)
+    lz.code = 0;
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        let is i64 as b with mut = 0;
+        if (lz.pos < lz.srclen) { b = cast(i64, lz.src[lz.pos]); }
+        lz.pos = lz.pos + 1;
+        lz.code = ((lz.code << 8) | b) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    lz.range = 0xFFFFFFFF;
+}
+
+fn _normalize(lz as *Lzma) as void {
+    if (lz.range < 0x1000000) {
+        lz.range = (lz.range << 8) & 0xFFFFFFFF;
+        let is i64 as b with mut = 0;
+        if (lz.pos < lz.srclen) { b = cast(i64, lz.src[lz.pos]); }
+        lz.pos = lz.pos + 1;
+        lz.code = ((lz.code << 8) | b) & 0xFFFFFFFF;
+    }
+}
+
+fn _dec_bit(lz as *Lzma, idx as i64) as i64 {
+    let is i64 as v = lz.probs[idx];
+    let is i64 as bound = (lz.range >> 11) * v;
+    let is i64 as bit with mut = 0;
+    if (lz.code < bound) {
+        lz.range = bound;
+        lz.probs[idx] = v + ((2048 - v) >> 5);
+        bit = 0;
+    } else {
+        lz.range = lz.range - bound;
+        lz.code = lz.code - bound;
+        lz.probs[idx] = v - (v >> 5);
+        bit = 1;
+    }
+    _normalize(lz);
+    return bit;
+}
+
+fn _bittree(lz as *Lzma, base as i64, numBits as i64) as i64 {
+    let is i64 as m with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < numBits) {
+        m = (m << 1) + _dec_bit(lz, base + m);
+        i = i + 1;
+    }
+    return m - (1 << numBits);
+}
+
+fn _bittree_rev(lz as *Lzma, base as i64, numBits as i64) as i64 {
+    let is i64 as m with mut = 1;
+    let is i64 as sym with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < numBits) {
+        let is i64 as bit = _dec_bit(lz, base + m);
+        m = (m << 1) + bit;
+        sym = sym | (bit << i);
+        i = i + 1;
+    }
+    return sym;
+}
+
+fn _dec_direct(lz as *Lzma, numBits as i64) as i64 {
+    let is i64 as res with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < numBits) {
+        lz.range = (lz.range >> 1) & 0xFFFFFFFF;
+        lz.code = (lz.code - lz.range) & 0xFFFFFFFF;
+        let is i64 as t = 0 - ((lz.code >> 31) & 1);   // 0 or -1
+        lz.code = (lz.code + (lz.range & t)) & 0xFFFFFFFF;
+        res = (res << 1) + (t + 1);
+        _normalize(lz);
+        i = i + 1;
+    }
+    return res;
+}
+
+// Length decoder. isRep selects the normal (0) or rep (1) length model.
+fn _dec_len(lz as *Lzma, isRep as i64, posState as i64) as i64 {
+    let is i64 as cO with mut = lz.o_lenChoice;
+    let is i64 as c2O with mut = lz.o_lenChoice2;
+    let is i64 as loO with mut = lz.o_lenLow;
+    let is i64 as miO with mut = lz.o_lenMid;
+    let is i64 as hiO with mut = lz.o_lenHigh;
+    if (isRep != 0) {
+        cO = lz.o_repChoice; c2O = lz.o_repChoice2;
+        loO = lz.o_repLow; miO = lz.o_repMid; hiO = lz.o_repHigh;
+    }
+    if (_dec_bit(lz, cO) == 0) {
+        return _bittree(lz, loO + (posState << 3), 3);
+    }
+    if (_dec_bit(lz, c2O) == 0) {
+        return 8 + _bittree(lz, miO + (posState << 3), 3);
+    }
+    return 16 + _bittree(lz, hiO, 8);
+}
+
+fn _dec_distance(lz as *Lzma, len as i64) as i64 {
+    let is i64 as lenState with mut = len;
+    if (lenState > 3) { lenState = 3; }
+    let is i64 as posSlot = _bittree(lz, lz.o_posSlot + (lenState << 6), 6);
+    if (posSlot < 4) { return posSlot; }
+    let is i64 as numDirect = (posSlot >> 1) - 1;
+    let is i64 as dist with mut = (2 | (posSlot & 1)) << numDirect;
+    if (posSlot < 14) {
+        dist = dist + _bittree_rev(lz, lz.o_specPos + dist - posSlot, numDirect);
+    } else {
+        dist = dist + (_dec_direct(lz, numDirect - 4) << 4);
+        dist = dist + _bittree_rev(lz, lz.o_align, 4);
+    }
+    return dist;
+}
+
+fn _dec_literal(lz as *Lzma, out as *bytes.Bytes) as i64 {
+    let is i64 as dpos = out.len - lz.dictStart;
+    let is i64 as prevByte with mut = 0;
+    if (dpos > 0) { prevByte = cast(i64, out.ptr[out.len - 1]); }
+    let is i64 as litState = ((dpos & ((1 << lz.lp) - 1)) << lz.lc) + (prevByte >> (8 - lz.lc));
+    let is i64 as base = lz.o_literal + 0x300 * litState;
+    let is i64 as symbol with mut = 1;
+    if (lz.state >= 7) {
+        let is i64 as matchByte with mut = cast(i64, out.ptr[out.len - lz.rep0 - 1]);
+        while (symbol < 0x100) {
+            let is i64 as matchBit = (matchByte >> 7) & 1;
+            matchByte = (matchByte << 1) & 0xFF;
+            let is i64 as bit = _dec_bit(lz, base + ((1 + matchBit) << 8) + symbol);
+            symbol = (symbol << 1) | bit;
+            if (matchBit != bit) { break; }
+        }
+    }
+    while (symbol < 0x100) {
+        symbol = (symbol << 1) | _dec_bit(lz, base + symbol);
+    }
+    return symbol & 0xFF;
+}
+
+fn _copy_match(out as *bytes.Bytes, dist as i64, len as i64) as i64 {
+    if (dist > out.len) { return errno.Z_BADDIST; }
+    if (bytes.bytes_reserve(out, len) < 0) { return errno.Z_OOM; }
+    let is i64 as s with mut = out.len - dist;
+    let is i64 as d with mut = out.len;
+    let is i64 as e = out.len + len;
+    while (d < e) { out.ptr[d] = out.ptr[s]; s = s + 1; d = d + 1; }
+    out.len = e;
+    return 0;
+}
+
+// Decode the LZMA stream into `out`. If sizeKnown, stop at `limit` output
+// bytes (LZMA2 path); otherwise run until the end marker.
+fn lzma_run(lz as *Lzma, out as *bytes.Bytes, limit as i64, sizeKnown as i64) as i64 {
+    while (1 == 1) {
+        if (sizeKnown == 1) {
+            if (out.len >= limit) { return 0; }
+        }
+        let is i64 as posState = (out.len - lz.dictStart) & (lz.numPosStates - 1);
+        if (_dec_bit(lz, lz.o_isMatch + (lz.state << 4) + posState) == 0) {
+            let is i64 as sym = _dec_literal(lz, out);
+            if (bytes.bytes_push(out, cast(u8, sym)) < 0) { return errno.Z_OOM; }
+            if (lz.state < 4) { lz.state = 0; }
+            else if (lz.state < 10) { lz.state = lz.state - 3; }
+            else { lz.state = lz.state - 6; }
+        } else {
+            let is i64 as len with mut = 0;
+            if (_dec_bit(lz, lz.o_isRep + lz.state) != 0) {
+                if (_dec_bit(lz, lz.o_isRepG0 + lz.state) == 0) {
+                    if (_dec_bit(lz, lz.o_isRep0Long + (lz.state << 4) + posState) == 0) {
+                        if (lz.state < 7) { lz.state = 9; } else { lz.state = 11; }
+                        len = 1;
+                    } else {
+                        len = _dec_len(lz, 1, posState) + 2;
+                        if (lz.state < 7) { lz.state = 8; } else { lz.state = 11; }
+                    }
+                } else {
+                    let is i64 as dist with mut = 0;
+                    if (_dec_bit(lz, lz.o_isRepG1 + lz.state) == 0) {
+                        dist = lz.rep1;
+                    } else {
+                        if (_dec_bit(lz, lz.o_isRepG2 + lz.state) == 0) {
+                            dist = lz.rep2;
+                        } else {
+                            dist = lz.rep3;
+                            lz.rep3 = lz.rep2;
+                        }
+                        lz.rep2 = lz.rep1;
+                    }
+                    lz.rep1 = lz.rep0;
+                    lz.rep0 = dist;
+                    len = _dec_len(lz, 1, posState) + 2;
+                    if (lz.state < 7) { lz.state = 8; } else { lz.state = 11; }
+                }
+            } else {
+                lz.rep3 = lz.rep2; lz.rep2 = lz.rep1; lz.rep1 = lz.rep0;
+                len = _dec_len(lz, 0, posState);
+                if (lz.state < 7) { lz.state = 7; } else { lz.state = 10; }
+                let is i64 as newdist = _dec_distance(lz, len);
+                if (newdist == 0xFFFFFFFF) { return 0; }       // end-of-stream marker
+                lz.rep0 = newdist;
+                len = len + 2;
+            }
+            let is i64 as cr = _copy_match(out, lz.rep0 + 1, len);
+            if (cr < 0) { return cr; }
+        }
+    }
+    return 0;
+}
+
+// --- ".lzma" alone-format wrapper --------------------------------------
+fn lzma_alone_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (src_len < 13) { return errno.Z_BADHDR; }
+    let is Lzma as lz;
+    let is i64 as ir = lzma_init(&lz, cast(i64, src[0]));
+    if (ir < 0) { return ir; }
+    lzma_reset_probs(&lz);
+    lz.dictStart = 0;
+
+    // bytes 5..12: uncompressed size (u64 LE); all-0xFF means unknown.
+    let is i64 as unpackSize with mut = 0;
+    let is i64 as allFF with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        let is i64 as b = cast(i64, src[5 + i]);
+        if (b != 255) { allFF = 0; }
+        unpackSize = unpackSize | (b << (8 * i));
+        i = i + 1;
+    }
+    let is i64 as sizeKnown with mut = 1;
+    if (allFF == 1) { sizeKnown = 0; }
+
+    lzma_rc_init(&lz, src, src_len, 13);
+    let is i64 as r = lzma_run(&lz, out, unpackSize, sizeKnown);
+    if (r < 0) { return r; }
+    return out.len;
+}

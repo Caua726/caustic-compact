@@ -29,7 +29,7 @@ directly by `mmap` (so decompressed output can grow without the 64 KB cap of the
 
 ```
 core/      errno · bytes (mmap-backed) · bitreader (LSB-first) · huffman (canonical) · checksum (CRC-32/Adler-32)
-formats/   inflate · zlib · gzip · deflate* · brotli* · zstd* · lz4* · snappy* · xz* · bzip2*
+formats/   inflate · zlib · gzip · deflate · lz4 · snappy · lzma · lzma2 · xz · zstd* · brotli* · bzip2*
 examples/  zcat (gunzip-to-stdout)
 tests/     run.sh · gen_fixtures.sh · test_*
 ```
@@ -57,9 +57,9 @@ tests/     run.sh · gen_fixtures.sh · test_*
 | 4 | gzip/zlib encode (→ HTTP gzip, PNG IDAT) | ✅ green (output reads in system `gunzip`) |
 | 5 | `formats/lz4` decode (block + frame, xxHash32) | ✅ green (incl. system `lz4`) |
 | 6 | `formats/snappy` decode (varint + copy types 1/2/3) | ✅ green |
-| 7 | `formats/zstd` decode (RFC 8878, FSE + Huffman) | ⏳ next |
-| 8 | `formats/brotli` decode (RFC 7932) | ⏳ |
-| 9 | `formats/xz` · `formats/lzma2` decode (LZMA range coder) | ⏳ |
+| 7 | `formats/lzma` · `formats/lzma2` · `formats/xz` decode (range coder) | ✅ green (incl. system `xz`) |
+| 8 | `formats/zstd` decode (RFC 8878, FSE + Huffman) | ⏳ next |
+| 9 | `formats/brotli` decode (RFC 7932) | ⏳ |
 | 10 | `formats/bzip2` decode (BWT) | ⏳ (optional) |
 
 ## Build & test

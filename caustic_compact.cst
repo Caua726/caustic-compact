@@ -23,3 +23,6 @@ use "formats/zlib.cst"    as zlib;
 use "formats/gzip.cst"    as gzip;
 use "formats/lz4.cst"     as lz4;
 use "formats/snappy.cst"  as snappy;
+use "formats/lzma.cst"    as lzma;
+use "formats/lzma2.cst"   as lzma2;
+use "formats/xz.cst"      as xz;

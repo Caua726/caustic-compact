@@ -1,0 +1,62 @@
+// =======================================================
+// caustic-compact/formats/lzma2.cst
+// LZMA2 — the chunked container around the LZMA core (used inside xz).
+// A sequence of chunks: control 0x00 ends the stream; 0x01/0x02 carry an
+// uncompressed chunk (0x01 also resets the dictionary); 0x80..0xFF carry an
+// LZMA chunk whose top bits select state/props/dict resets. The range coder
+// is re-initialized for every LZMA chunk.
+//   lzma2_decode(src, off, len, out) -> input bytes consumed, or -err.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "lzma.cst" as lzma;
+
+fn lzma2_decode(src as *u8, off as i64, len as i64, out as *bytes.Bytes) as i64 {
+    let is lzma.Lzma as lz;
+    lz.dictStart = 0;
+    let is i64 as lastProps with mut = 0 - 1;
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + len;
+
+    while (pos < end) {
+        let is i64 as control = cast(i64, src[pos]);
+        pos = pos + 1;
+        if (control == 0) { return pos - off; }          // end of LZMA2 stream
+
+        if (control < 3) {
+            // uncompressed chunk: 1 = reset dict, 2 = keep dict
+            if (pos + 2 > end) { return errno.Z_EOF; }
+            let is i64 as usize = ((cast(i64, src[pos]) << 8) | cast(i64, src[pos + 1])) + 1;
+            pos = pos + 2;
+            if (control == 1) { lz.dictStart = out.len; }
+            if (pos + usize > end) { return errno.Z_EOF; }
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), usize) < 0) { return errno.Z_OOM; }
+            pos = pos + usize;
+        } else if (control >= 0x80) {
+            let is i64 as usize = (((control & 0x1F) << 16) | (cast(i64, src[pos]) << 8) | cast(i64, src[pos + 1])) + 1;
+            pos = pos + 2;
+            let is i64 as csize = ((cast(i64, src[pos]) << 8) | cast(i64, src[pos + 1])) + 1;
+            pos = pos + 2;
+            let is i64 as reset = (control >> 5) & 3;
+            if (reset >= 2) {
+                let is i64 as props = cast(i64, src[pos]);
+                pos = pos + 1;
+                if (props != lastProps) {
+                    let is i64 as ir = lzma.lzma_init(&lz, props);
+                    if (ir < 0) { return ir; }
+                    lastProps = props;
+                }
+            }
+            if (reset >= 1) { lzma.lzma_reset_probs(&lz); }
+            if (reset == 3) { lz.dictStart = out.len; }
+            lzma.lzma_rc_init(&lz, src, end, pos);
+            let is i64 as r = lzma.lzma_run(&lz, out, out.len + usize, 1);
+            if (r < 0) { return r; }
+            pos = pos + csize;
+        } else {
+            return errno.Z_BADTYPE;                       // invalid control byte
+        }
+    }
+    return pos - off;
+}

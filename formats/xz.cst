@@ -1,0 +1,76 @@
+// =======================================================
+// caustic-compact/formats/xz.cst
+// xz container (magic FD 37 7A 58 5A 00) wrapping LZMA2-compressed blocks.
+// Parses the stream header, then each block header (flags + filter list,
+// expecting the LZMA2 filter 0x21), decodes the LZMA2 payload, and skips
+// padding + the per-block check until the index indicator (0x00).
+//   xz_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "lzma2.cst" as lzma2;
+
+// xz multibyte integer (LEB128, little-endian, high bit = continue).
+fn _varint(src as *u8, p as *i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as shift with mut = 0;
+    while (1 == 1) {
+        let is i64 as b = cast(i64, src[p[0]]);
+        p[0] = p[0] + 1;
+        v = v | ((b & 0x7F) << shift);
+        if ((b & 0x80) == 0) { return v; }
+        shift = shift + 7;
+    }
+    return v;
+}
+
+fn _check_size(t as i64) as i64 {
+    if (t == 0) { return 0; }     // None
+    if (t == 1) { return 4; }     // CRC32
+    if (t == 4) { return 8; }     // CRC64
+    if (t == 10) { return 32; }   // SHA-256
+    return 0;
+}
+
+fn xz_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (src_len < 12) { return errno.Z_BADHDR; }
+    if (cast(i64, src[0]) != 0xFD) { return errno.Z_BADHDR; }
+    if (cast(i64, src[1]) != 0x37) { return errno.Z_BADHDR; }
+    if (cast(i64, src[2]) != 0x7A) { return errno.Z_BADHDR; }
+    if (cast(i64, src[3]) != 0x58) { return errno.Z_BADHDR; }
+    if (cast(i64, src[4]) != 0x5A) { return errno.Z_BADHDR; }
+    if (cast(i64, src[5]) != 0x00) { return errno.Z_BADHDR; }
+    let is i64 as checkSize = _check_size(cast(i64, src[7]) & 0x0F);
+
+    let is i64 as pos with mut = 12;             // past 12-byte stream header
+    while (pos < src_len) {
+        let is i64 as bhs = cast(i64, src[pos]);
+        if (bhs == 0) { return out.len; }        // index indicator -> done
+        let is i64 as headerSize = (bhs + 1) * 4;
+        let is i64 as hdrStart = pos;
+        let is i64 as blockFlags = cast(i64, src[pos + 1]);
+        let is i64 as numFilters = (blockFlags & 3) + 1;
+
+        let is i64 as p with mut = pos + 2;
+        if (((blockFlags >> 6) & 1) == 1) { _varint(src, &p); }   // compressed size
+        if (((blockFlags >> 7) & 1) == 1) { _varint(src, &p); }   // uncompressed size
+        let is i64 as fi with mut = 0;
+        while (fi < numFilters) {
+            _varint(src, &p);                                     // filter id
+            let is i64 as propSize = _varint(src, &p);            // props length
+            p = p + propSize;                                     // skip props
+            fi = fi + 1;
+        }
+
+        let is i64 as dataStart = hdrStart + headerSize;          // past header + CRC32
+        let is i64 as consumed = lzma2.lzma2_decode(src, dataStart, src_len - dataStart, out);
+        if (consumed < 0) { return consumed; }
+
+        let is i64 as after with mut = dataStart + consumed;
+        after = (after + 3) & 0x7FFFFFFFFFFFFFFC;                 // pad to 4-byte boundary
+        after = after + checkSize;                               // skip the block check
+        pos = after;
+    }
+    return out.len;
+}
