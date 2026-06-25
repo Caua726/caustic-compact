@@ -1,83 +1,67 @@
 # caustic-compact
 
-A pure-Caustic, zero-dependency (de)compression library — DEFLATE/zlib/gzip
-today, with Brotli/Zstd/LZ4/Snappy and encoders landing phase by phase. Built
-on nothing but the Caustic stdlib (`std/mem`, `std/io`): **no libc, no zlib, no
-external libraries**. Philosophy (same as caustic-net): direct functions, one
-file per format, no framework.
+A from-scratch compression library written in [Caustic](https://github.com/Caua726/Caustic), a systems language with its own compiler, assembler, and linker. It decompresses and compresses eleven formats — gzip, zlib, DEFLATE, LZ4, Snappy, LZMA, LZMA2, xz, bzip2, Zstandard, and Brotli — with no libc, no zlib, no external libraries. Just the Caustic standard library and Linux syscalls.
 
-## Keystone: `inflate`
+Every decoder and encoder interoperates with the standard tools: our gzip reads in `gunzip`, our `.xz` opens in `xz -d`, `.bz2` in `bzip2 -d`, `.zst` in `zstd -d`, `.br` in `brotli -d`.
 
-Everything web decodes through one routine — raw DEFLATE (RFC 1951):
-
-```cst
-fn inflate(src as *u8, src_len as i64, out as *bytes.Bytes) as i64;  // bytes, or -err
+```sh
+build/zcat file.gz         # decompress a gzip file to stdout
+build/gzc  file > file.gz  # compress a file to gzip
 ```
 
-zlib (RFC 1950), gzip (RFC 1952) and PNG IDAT are thin containers over it:
+Around 4,600 lines of Caustic across ~20 modules — one file per format under `formats/`, shared building blocks under `core/` — plus Brotli's embedded 122 KB static dictionary. x86_64 Linux.
 
-```cst
-fn zlib_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64;  // + Adler-32
-fn gzip_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64;  // + CRC-32 + ISIZE
+## Formats
+
+| Format | Decode | Encode |
+|---|---|---|
+| DEFLATE / zlib / gzip — RFC 1951 / 1950 / 1952 | yes | yes — fixed Huffman + LZ77 |
+| LZ4 — frame + block | yes | yes — greedy hash matcher |
+| Snappy — raw block | yes | yes — greedy hash matcher |
+| LZMA / LZMA2 / xz | yes | yes — range coder + greedy matcher |
+| bzip2 | yes | yes — BWT + MTF + Huffman |
+| Zstandard — RFC 8878 | yes | store mode (raw blocks) |
+| Brotli — RFC 7932 | yes | store mode (uncompressed meta-blocks) |
+
+The keystone is `formats/inflate.cst` (raw DEFLATE); zlib, gzip, and PNG's IDAT stream are thin containers over it. zstd and brotli are full decoders — brotli ships the entire 122 KB static dictionary and its 121 word transforms; zstd has the FSE entropy decoder, Huffman literals, and the sequence machine with its offset history.
+
+The whole library, decode and encode, is exercised by one test runner (itself a Caustic program) against vectors produced by the real system tools.
+
+## What's not there yet
+
+This is an honest list of where it stops short of the reference implementations.
+
+- **zstd and brotli encode are store mode** — valid and tool-decodable, but they do not actually compress. The real FSE/Huffman (zstd) and prefix-code/context (brotli) encoders are not written.
+- **DEFLATE encode uses fixed Huffman only** — no dynamic Huffman and no stored-block fallback, so incompressible data grows a few percent.
+- **bzip2 encode is single-block** (≤ 900 KB) and uses two identical Huffman tables instead of the reference's up-to-six.
+- **Decode does not verify checksums** for zstd / xz / bzip2 (gzip / zlib / lz4 do).
+- **Snappy is the raw block format**, not the framed `.sz` stream format.
+- One-shot and in-memory — no streaming API. No large-window Brotli, no xz delta/BCJ filters, no dictionaries.
+
+## Build and test
+
+The Caustic toolchain (`caustic`) must be on your `PATH`; the standard library resolves from the install path. The test runner is a Caustic program, and the compressed test vectors under `tests/fixtures/` are committed as data — there are no shell or other-language scripts in the repository.
+
+```sh
+caustic tests/run.cst -o tests/runtests   # build the runner
+tests/runtests                            # decode + encode round-trips; exit 0 = all green
+caustic -c caustic_compact.cst            # compile-check the whole library (no main)
 ```
-
-Output accumulates in `core/bytes.cst`'s `Bytes` — a growable buffer backed
-directly by `mmap` (so decompressed output can grow without the 64 KB cap of the
-`bins` slab allocator).
 
 ## Layout
 
 ```
-core/      errno · bytes (mmap-backed) · bitreader (LSB-first) · huffman (canonical) · checksum (CRC-32/Adler-32)
+core/      errno · bytes (mmap-backed) · bitreader / bitwriter · huffman · checksum (CRC-32 / Adler-32 / xxHash32)
 formats/   inflate · zlib · gzip · deflate · lz4 · snappy · lzma · lzma2 · xz · bzip2 · zstd · brotli
-examples/  zcat (gunzip-to-stdout)
-tests/     run.sh · gen_fixtures.sh · test_*
+           brotli_dict (122 KB dictionary) · brotli_transforms
+examples/  zcat (gunzip-to-stdout) · gzc (gzip a file)
+tests/     run.cst (the runner) · fixtures/ (committed vectors)
 ```
-`*` = on the roadmap, not yet landed.
 
-## Conventions
+Conventions, like the sibling [`caustic-net`](https://github.com/Caua726/caustic-net): errors are negative `i64` codes (`core/errno.cst`); the output buffer is `mmap`-backed so it grows past the 64 KB cap of the `bins` slab allocator; `snake_case` functions, `PascalCase` structs, `_prefix` private, `SCREAMING` constants. No generic `Result`/`Option` (the compiler can't construct them).
 
-- **Errors:** every entry point returns a non-negative count on success or a
-  negative code from `core/errno.cst` (`Z_EOF`, `Z_BADHUFF`, `Z_BADDIST`,
-  `Z_BADSUM`, …). No generic `Result`/`Option` (the compiler can't construct them).
-- **Memory:** small fixed structures (Huffman tables, constant tables) use the
-  stdlib `bins` allocator per module; the unbounded output buffer uses `mmap`
-  via `core/bytes.cst`.
-- **Naming:** `snake_case` fns, `PascalCase` structs, `_prefix` private,
-  `SCREAMING` constants `with imut`.
+## License
 
-## Status
+MIT — see [LICENSE](LICENSE).
 
-Every format also has an **encoder**: deflate/gzip/zlib (fixed-Huffman),
-lz4/snappy (greedy matcher), lzma/xz (range encoder + greedy matcher), bzip2
-(forward BWT + length-limited Huffman), and zstd/brotli (valid store mode —
-raw blocks / uncompressed meta-blocks). Each encoder's output round-trips
-through the matching decoder and decompresses with the system tool.
-
-| Phase | Module | State |
-|---|---|---|
-| 0 | `core/` errno · bytes · bitreader · huffman · checksum | ✅ green (`tests/test_core`) |
-| 1 | `formats/inflate` (stored + fixed + dynamic, overlap-safe LZ77) | ✅ green (`tests/test_inflate`, 10 fixtures) |
-| 2 | `formats/zlib` · `formats/gzip` (+ checksum/ISIZE verify) | ✅ green (`tests/test_gzip`, incl. system `gzip`) |
-| 3 | `formats/deflate` encode (+ `core/bitwriter`) | ✅ green (`tests/test_deflate` round-trips) |
-| 4 | gzip/zlib encode (→ HTTP gzip, PNG IDAT) | ✅ green (output reads in system `gunzip`) |
-| 5 | `formats/lz4` decode (block + frame, xxHash32) | ✅ green (incl. system `lz4`) |
-| 6 | `formats/snappy` decode (varint + copy types 1/2/3) | ✅ green |
-| 7 | `formats/lzma` · `formats/lzma2` · `formats/xz` decode (range coder) | ✅ green (incl. system `xz`) |
-| 8 | `formats/bzip2` decode (Huffman + MTF + inverse BWT + RLE) | ✅ green (incl. system `bzip2`) |
-| 9 | `formats/zstd` decode (RFC 8878, FSE + Huffman + sequences) | ✅ green (incl. system `zstd -19`) |
-| 10 | `formats/brotli` decode (RFC 7932, static dictionary + transforms) | ✅ green (incl. system `brotli -q 11`) |
-
-## Build & test
-
-The Caustic toolchain (`caustic`) must be installed; the stdlib resolves from
-the install path, so `use "std/mem.cst"` just works. The test runner is itself
-a Caustic program (`tests/run.cst`) — no shell or other languages in the repo;
-the compressed test vectors under `tests/fixtures/` are committed as data.
-
-```sh
-caustic tests/run.cst -o tests/runtests   # build the test runner
-tests/runtests                            # run every suite, exit 0 = all green
-caustic -c caustic_compact.cst            # compile-check the whole library (no main)
-caustic examples/zcat.cst -o zcat && ./zcat file.gz   # decompress a gzip file
-```
+The compression *formats* are open specifications, implemented here from their RFCs. A few parts are ported from, or embed data from, permissively licensed reference implementations (Brotli — MIT; the Zstandard educational decoder — BSD; bzip2 — BSD-style; xxHash — BSD; LZMA — public domain). None are copyleft. Their copyright notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
