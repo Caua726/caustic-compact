@@ -1,0 +1,118 @@
+// =======================================================
+// caustic-compact/formats/lz4.cst
+// LZ4 decompression — frame format (magic 0x184D2204) wrapping LZ4 blocks.
+// Block format: token (4-bit literal len + 4-bit match len-4), each length
+// extensible via 0xFF bytes; 2-byte little-endian match offset; overlap-safe
+// copy. Content checksum (xxHash32) is verified when present.
+//   lz4_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "../core/checksum.cst" as checksum;
+
+fn _le32(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8)
+         | (cast(i64, p[off + 2]) << 16) | (cast(i64, p[off + 3]) << 24);
+}
+
+// Decode one LZ4 block [off, off+blen) into out (appends).
+fn _lz4_block(src as *u8, off as i64, blen as i64, out as *bytes.Bytes) as i64 {
+    let is i64 as ip with mut = off;
+    let is i64 as iend = off + blen;
+    while (ip < iend) {
+        let is i64 as token = cast(i64, src[ip]);
+        ip = ip + 1;
+
+        // literal length (high nibble, extensible)
+        let is i64 as litlen with mut = token >> 4;
+        if (litlen == 15) {
+            while (ip < iend) {
+                let is i64 as b = cast(i64, src[ip]);
+                ip = ip + 1;
+                litlen = litlen + b;
+                if (b != 255) { break; }
+            }
+        }
+        if (litlen > 0) {
+            if (ip + litlen > iend) { return errno.Z_EOF; }
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + ip), litlen) < 0) { return errno.Z_OOM; }
+            ip = ip + litlen;
+        }
+        if (ip >= iend) { break; }                 // final sequence: literals only
+
+        // match: 2-byte little-endian offset
+        if (ip + 2 > iend) { return errno.Z_EOF; }
+        let is i64 as offset = cast(i64, src[ip]) | (cast(i64, src[ip + 1]) << 8);
+        ip = ip + 2;
+        if (offset == 0) { return errno.Z_BADDIST; }
+
+        // match length (low nibble + 4, extensible)
+        let is i64 as matchlen with mut = (token & 0x0F) + 4;
+        if ((token & 0x0F) == 15) {
+            while (ip < iend) {
+                let is i64 as b = cast(i64, src[ip]);
+                ip = ip + 1;
+                matchlen = matchlen + b;
+                if (b != 255) { break; }
+            }
+        }
+
+        // overlap-safe copy from `offset` bytes back in the output
+        if (offset > out.len) { return errno.Z_BADDIST; }
+        if (bytes.bytes_reserve(out, matchlen) < 0) { return errno.Z_OOM; }
+        let is i64 as s with mut = out.len - offset;
+        let is i64 as d with mut = out.len;
+        let is i64 as e = out.len + matchlen;
+        while (d < e) {
+            out.ptr[d] = out.ptr[s];
+            s = s + 1;
+            d = d + 1;
+        }
+        out.len = e;
+    }
+    return 0;
+}
+
+fn lz4_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (src_len < 7) { return errno.Z_BADHDR; }
+    if (_le32(src, 0) != 0x184D2204) { return errno.Z_BADHDR; }   // frame magic
+
+    let is i64 as pos with mut = 4;
+    let is i64 as flg = cast(i64, src[pos]); pos = pos + 1;
+    pos = pos + 1;                                   // BD byte (max block size; unused here)
+    if (((flg >> 6) & 3) != 1) { return errno.Z_BADHDR; }   // version must be 01
+
+    let is i64 as block_checksum   = (flg >> 4) & 1;
+    let is i64 as content_size     = (flg >> 3) & 1;
+    let is i64 as content_checksum = (flg >> 2) & 1;
+    let is i64 as dict_id          = flg & 1;
+
+    if (content_size == 1) { pos = pos + 8; }
+    if (dict_id == 1) { pos = pos + 4; }
+    pos = pos + 1;                                   // header checksum byte (skip)
+
+    while (pos + 4 <= src_len) {
+        let is i64 as bsize = _le32(src, pos);
+        pos = pos + 4;
+        if (bsize == 0) { break; }                   // EndMark
+        let is i64 as uncompressed = bsize & 0x80000000;
+        let is i64 as realsize = bsize & 0x7FFFFFFF;
+        if (pos + realsize > src_len) { return errno.Z_EOF; }
+        if (uncompressed != 0) {
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), realsize) < 0) { return errno.Z_OOM; }
+        } else {
+            let is i64 as r = _lz4_block(src, pos, realsize, out);
+            if (r < 0) { return r; }
+        }
+        pos = pos + realsize;
+        if (block_checksum == 1) { pos = pos + 4; }
+    }
+
+    if (content_checksum == 1) {
+        if (pos + 4 > src_len) { return errno.Z_EOF; }
+        let is i64 as stored = _le32(src, pos);
+        if (checksum.xxhash32(out.ptr, out.len) != stored) { return errno.Z_BADSUM; }
+    }
+    return out.len;
+}

@@ -1,0 +1,213 @@
+// =======================================================
+// caustic-compact/formats/deflate.cst
+// DEFLATE compression (RFC 1951).
+//   level 0      -> stored blocks only (no compression, always valid).
+//   level >= 1   -> a single fixed-Huffman block with greedy LZ77 matching
+//                   (hash-chain over a 32 KB window). Output is decodable by
+//                   any DEFLATE/zlib/gzip implementation (verified vs gunzip).
+//   deflate_compress(src, src_len, out, level) -> bytes written, or -err.
+// Dynamic-Huffman code generation is a later optimization; fixed Huffman
+// already gives real, interoperable compression.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "../core/bitwriter.cst" as bitwriter;
+use "std/mem.cst" only bins, core as mem;
+
+// --- length/distance base+extra tables (encode side) -------------------
+let is *i64 as LBASE  with mut;
+let is *i64 as LEXTRA with mut;
+let is *i64 as DBASE  with mut;
+let is *i64 as DEXTRA with mut;
+let is i32 as _ready with mut = 0;
+
+fn _tab(n as i64) as *i64 { return cast(*i64, mem.core.mmap_anon(n * 8)); }
+
+fn _enc_init() as void {
+    if (_ready == 1) { return; }
+    LBASE = _tab(29); LEXTRA = _tab(29); DBASE = _tab(30); DEXTRA = _tab(30);
+
+    LBASE[0]=3;   LBASE[1]=4;   LBASE[2]=5;   LBASE[3]=6;   LBASE[4]=7;
+    LBASE[5]=8;   LBASE[6]=9;   LBASE[7]=10;  LBASE[8]=11;  LBASE[9]=13;
+    LBASE[10]=15; LBASE[11]=17; LBASE[12]=19; LBASE[13]=23; LBASE[14]=27;
+    LBASE[15]=31; LBASE[16]=35; LBASE[17]=43; LBASE[18]=51; LBASE[19]=59;
+    LBASE[20]=67; LBASE[21]=83; LBASE[22]=99; LBASE[23]=115; LBASE[24]=131;
+    LBASE[25]=163; LBASE[26]=195; LBASE[27]=227; LBASE[28]=258;
+    LEXTRA[0]=0;  LEXTRA[1]=0;  LEXTRA[2]=0;  LEXTRA[3]=0;  LEXTRA[4]=0;
+    LEXTRA[5]=0;  LEXTRA[6]=0;  LEXTRA[7]=0;  LEXTRA[8]=1;  LEXTRA[9]=1;
+    LEXTRA[10]=1; LEXTRA[11]=1; LEXTRA[12]=2; LEXTRA[13]=2; LEXTRA[14]=2;
+    LEXTRA[15]=2; LEXTRA[16]=3; LEXTRA[17]=3; LEXTRA[18]=3; LEXTRA[19]=3;
+    LEXTRA[20]=4; LEXTRA[21]=4; LEXTRA[22]=4; LEXTRA[23]=4; LEXTRA[24]=5;
+    LEXTRA[25]=5; LEXTRA[26]=5; LEXTRA[27]=5; LEXTRA[28]=0;
+
+    DBASE[0]=1;    DBASE[1]=2;    DBASE[2]=3;    DBASE[3]=4;    DBASE[4]=5;
+    DBASE[5]=7;    DBASE[6]=9;    DBASE[7]=13;   DBASE[8]=17;   DBASE[9]=25;
+    DBASE[10]=33;  DBASE[11]=49;  DBASE[12]=65;  DBASE[13]=97;  DBASE[14]=129;
+    DBASE[15]=193; DBASE[16]=257; DBASE[17]=385; DBASE[18]=513; DBASE[19]=769;
+    DBASE[20]=1025; DBASE[21]=1537; DBASE[22]=2049; DBASE[23]=3073;
+    DBASE[24]=4097; DBASE[25]=6145; DBASE[26]=8193; DBASE[27]=12289;
+    DBASE[28]=16385; DBASE[29]=24577;
+    DEXTRA[0]=0;   DEXTRA[1]=0;   DEXTRA[2]=0;   DEXTRA[3]=0;   DEXTRA[4]=1;
+    DEXTRA[5]=1;   DEXTRA[6]=2;   DEXTRA[7]=2;   DEXTRA[8]=3;   DEXTRA[9]=3;
+    DEXTRA[10]=4;  DEXTRA[11]=4;  DEXTRA[12]=5;  DEXTRA[13]=5;  DEXTRA[14]=6;
+    DEXTRA[15]=6;  DEXTRA[16]=7;  DEXTRA[17]=7;  DEXTRA[18]=8;  DEXTRA[19]=8;
+    DEXTRA[20]=9;  DEXTRA[21]=9;  DEXTRA[22]=10; DEXTRA[23]=10; DEXTRA[24]=11;
+    DEXTRA[25]=11; DEXTRA[26]=12; DEXTRA[27]=12; DEXTRA[28]=13; DEXTRA[29]=13;
+    _ready = 1;
+}
+
+// --- fixed-Huffman symbol emitters -------------------------------------
+fn _emit_litlen(bw as *bitwriter.BitWriter, sym as i64) as void {
+    if (sym < 144)      { bitwriter.bw_huff(bw, 0x30 + sym, 8); }
+    else if (sym < 256) { bitwriter.bw_huff(bw, 0x190 + (sym - 144), 9); }
+    else if (sym < 280) { bitwriter.bw_huff(bw, sym - 256, 7); }
+    else                { bitwriter.bw_huff(bw, 0xC0 + (sym - 280), 8); }
+}
+
+fn _length_code(len as i64) as i64 {
+    let is i64 as li with mut = 0;
+    while (li < 28) {
+        if (LBASE[li + 1] > len) { break; }
+        li = li + 1;
+    }
+    return li;
+}
+
+fn _dist_code(dist as i64) as i64 {
+    let is i64 as d with mut = 0;
+    while (d < 29) {
+        if (DBASE[d + 1] > dist) { break; }
+        d = d + 1;
+    }
+    return d;
+}
+
+fn _emit_match(bw as *bitwriter.BitWriter, len as i64, dist as i64) as void {
+    let is i64 as li = _length_code(len);
+    _emit_litlen(bw, 257 + li);
+    if (LEXTRA[li] > 0) { bitwriter.bw_bits(bw, len - LBASE[li], LEXTRA[li]); }
+    let is i64 as d = _dist_code(dist);
+    bitwriter.bw_huff(bw, d, 5);                       // fixed distance codes are 5-bit
+    if (DEXTRA[d] > 0) { bitwriter.bw_bits(bw, dist - DBASE[d], DEXTRA[d]); }
+}
+
+// --- stored blocks (level 0) -------------------------------------------
+fn _deflate_stored(bw as *bitwriter.BitWriter, src as *u8, src_len as i64) as i64 {
+    let is i64 as pos with mut = 0;
+    let is i64 as first with mut = 1;
+    while (pos < src_len || first == 1) {
+        first = 0;
+        let is i64 as blen with mut = src_len - pos;
+        if (blen > 65535) { blen = 65535; }
+        let is i64 as fin with mut = 0;
+        if (pos + blen >= src_len) { fin = 1; }
+        bitwriter.bw_bits(bw, fin, 1);
+        bitwriter.bw_bits(bw, 0, 2);                   // BTYPE 00
+        bitwriter.bw_align(bw);
+        let is i64 as nlen = blen ^ 0xFFFF;
+        bytes.bytes_push(bw.out, cast(u8, blen & 0xFF));
+        bytes.bytes_push(bw.out, cast(u8, (blen >> 8) & 0xFF));
+        bytes.bytes_push(bw.out, cast(u8, nlen & 0xFF));
+        bytes.bytes_push(bw.out, cast(u8, (nlen >> 8) & 0xFF));
+        if (blen > 0) {
+            bytes.bytes_append(bw.out, cast(*u8, cast(i64, src) + pos), blen);
+        }
+        pos = pos + blen;
+    }
+    return 0;
+}
+
+// --- fixed-Huffman block with hash-chain LZ77 --------------------------
+let is i64 as _HASH_SIZE with imut = 32768;   // 1 << 15
+let is i64 as _WSIZE     with imut = 32768;
+let is i64 as _MAX_CHAIN with imut = 256;
+
+fn _hash(src as *u8, pos as i64) as i64 {
+    return ((cast(i64, src[pos]) << 10) ^ (cast(i64, src[pos + 1]) << 5)
+            ^ cast(i64, src[pos + 2])) & 0x7FFF;
+}
+
+fn _match_len(src as *u8, a as i64, b as i64, maxlen as i64) as i64 {
+    let is i64 as l with mut = 0;
+    while (l < maxlen) {
+        if (src[a + l] != src[b + l]) { break; }
+        l = l + 1;
+    }
+    return l;
+}
+
+fn _deflate_fixed(bw as *bitwriter.BitWriter, src as *u8, src_len as i64) as i64 {
+    bitwriter.bw_bits(bw, 1, 1);                       // BFINAL = 1
+    bitwriter.bw_bits(bw, 1, 2);                       // BTYPE 01 (fixed)
+
+    if (src_len > 0) {
+        let is *i64 as head = cast(*i64, mem.core.mmap_anon(_HASH_SIZE * 8));
+        let is *i64 as prev = cast(*i64, mem.core.mmap_anon(src_len * 8));
+        if (cast(i64, head) <= 0 || cast(i64, prev) <= 0) { return errno.Z_OOM; }
+        mem.core.memset(cast(*u8, head), cast(i32, 0xFF), _HASH_SIZE * 8);  // all -1
+        mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), src_len * 8);
+
+        let is i64 as pos with mut = 0;
+        while (pos < src_len) {
+            let is i64 as best_len with mut = 0;
+            let is i64 as best_dist with mut = 0;
+            if (pos + 3 <= src_len) {
+                let is i64 as h = _hash(src, pos);
+                let is i64 as cand with mut = head[h];
+                let is i64 as chain with mut = 0;
+                let is i64 as maxl with mut = src_len - pos;
+                if (maxl > 258) { maxl = 258; }
+                while (cand >= 0) {
+                    if (pos - cand > _WSIZE) { break; }
+                    if (chain >= _MAX_CHAIN) { break; }
+                    let is i64 as l = _match_len(src, cand, pos, maxl);
+                    if (l > best_len) {
+                        best_len = l;
+                        best_dist = pos - cand;
+                        if (l >= maxl) { break; }
+                    }
+                    cand = prev[cand];
+                    chain = chain + 1;
+                }
+                prev[pos] = head[h];
+                head[h] = pos;
+            }
+            if (best_len >= 3) {
+                _emit_match(bw, best_len, best_dist);
+                let is i64 as k with mut = 1;
+                while (k < best_len) {
+                    if (pos + k + 3 <= src_len) {
+                        let is i64 as hk = _hash(src, pos + k);
+                        prev[pos + k] = head[hk];
+                        head[hk] = pos + k;
+                    }
+                    k = k + 1;
+                }
+                pos = pos + best_len;
+            } else {
+                _emit_litlen(bw, cast(i64, src[pos]));
+                pos = pos + 1;
+            }
+        }
+        mem.core.munmap(cast(*u8, head), _HASH_SIZE * 8);
+        mem.core.munmap(cast(*u8, prev), src_len * 8);
+    }
+
+    _emit_litlen(bw, 256);                             // end of block
+    bitwriter.bw_align(bw);
+    return 0;
+}
+
+// --- public API --------------------------------------------------------
+fn deflate_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    _enc_init();
+    let is bitwriter.BitWriter as bw;
+    bitwriter.bw_init(&bw, out);
+    let is i64 as r with mut = 0;
+    if (level <= 0) { r = _deflate_stored(&bw, src, src_len); }
+    else { r = _deflate_fixed(&bw, src, src_len); }
+    if (r < 0) { return r; }
+    if (bw.err < 0) { return errno.Z_OOM; }
+    return out.len;
+}

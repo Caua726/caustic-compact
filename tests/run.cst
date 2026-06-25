@@ -1,0 +1,236 @@
+// =======================================================
+// tests/run.cst — caustic-compact test runner (pure Caustic, no shell).
+// Runs every suite in-process against the committed fixtures in
+// tests/fixtures/ and exits 0 iff all pass (non-zero = total failures).
+// Build:  caustic tests/run.cst -o tests/runtests
+// Run from the repo root:  tests/runtests
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/mem.cst" only bins, core as mem;
+use "../core/bitreader.cst" as bitreader;
+use "../core/huffman.cst" as huffman;
+use "../core/checksum.cst" as checksum;
+use "../core/bytes.cst" as bytes;
+use "../formats/inflate.cst" as inflate;
+use "../formats/deflate.cst" as deflate;
+use "../formats/gzip.cst" as gzip;
+use "../formats/zlib.cst" as zlib;
+use "../formats/lz4.cst" as lz4;
+use "../formats/snappy.cst" as snappy;
+
+// --- shared helpers ----------------------------------------------------
+fn _alloc(n as i64) as *u8 { return mem.core.mmap_anon(n); }
+
+fn read_whole(path as *u8, out_len as *i64) as *u8 {
+    let is i64 as sz = io.file_size(path);
+    if (sz < 0) { return cast(*u8, 0); }
+    let is *u8 as buf = _alloc(sz + 1);
+    if (cast(i64, buf) == 0) { return cast(*u8, 0); }
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as got with mut = 0;
+    if (sz > 0) { got = io.read_exact(fd, buf, sz); }
+    io._close_fd(fd);
+    if (got != sz) { return cast(*u8, 0); }
+    out_len[0] = sz;
+    return buf;
+}
+
+// kind: 0 inflate, 1 gzip, 2 zlib, 3 lz4, 4 snappy
+fn _decode(kind as i64, comp as *u8, clen as i64, out as *bytes.Bytes) as i64 {
+    if (kind == 0) { return inflate.inflate(comp, clen, out); }
+    if (kind == 1) { return gzip.gzip_decompress(comp, clen, out); }
+    if (kind == 2) { return zlib.zlib_decompress(comp, clen, out); }
+    if (kind == 3) { return lz4.lz4_decompress(comp, clen, out); }
+    if (kind == 4) { return snappy.snappy_decompress(comp, clen, out); }
+    return 0 - 1;
+}
+
+fn _same(out as *bytes.Bytes, exp as *u8, elen as i64) as i64 {
+    if (out.len != elen) { return 0; }
+    if (elen == 0) { return 1; }
+    if (mem.core.memcmp(out.ptr, exp, elen) != 0) { return 0; }
+    return 1;
+}
+
+// Decode comp_path with `kind` and compare against bin_path. Prints result.
+fn check(kind as i64, name as *u8, comp_path as *u8, bin_path as *u8) as i64 {
+    io.write_str(io.STDOUT, "  ");
+    io.write_str(io.STDOUT, name);
+    let is i64 as clen with mut = 0;
+    let is *u8 as comp = read_whole(comp_path, &clen);
+    if (cast(i64, comp) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is i64 as elen with mut = 0;
+    let is *u8 as exp = read_whole(bin_path, &elen);
+    if (cast(i64, exp) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is bytes.Bytes as out = bytes.bytes_new(256);
+    let is i64 as r = _decode(kind, comp, clen, &out);
+    let is i64 as ok with mut = 0;
+    if (r >= 0) { ok = _same(&out, exp, elen); }
+    bytes.bytes_free(&out);
+    if (ok == 1) { io.write_str(io.STDOUT, " ... PASS\n"); return 0; }
+    io.write_str(io.STDOUT, " ... FAIL\n");
+    return 1;
+}
+
+// --- suites ------------------------------------------------------------
+fn suite_core() as i64 {
+    io.write_str(io.STDOUT, "[core]\n");
+    let is i64 as bad with mut = 0;
+
+    // bitreader: read LSB-first fields from [0x2D, 0x01] -> 1, 2, 5, 1
+    let is [2]u8 as bd;
+    bd[0] = cast(u8, 0x2D); bd[1] = cast(u8, 0x01);
+    let is bitreader.BitReader as br;
+    bitreader.br_init(&br, cast(*u8, &bd), 2);
+    if (bitreader.br_get(&br, 1) != 1) { bad = bad + 1; }
+    if (bitreader.br_get(&br, 2) != 2) { bad = bad + 1; }
+    if (bitreader.br_get(&br, 5) != 5) { bad = bad + 1; }
+    if (bitreader.br_get(&br, 8) != 1) { bad = bad + 1; }
+
+    // huffman: lengths [1,2,3,3] decode [0xDA,0x01] -> 0,1,2,3
+    let is [4]i64 as lens;
+    lens[0] = 1; lens[1] = 2; lens[2] = 3; lens[3] = 3;
+    let is huffman.Huff as h;
+    if (huffman.huff_build(&h, cast(*i64, &lens), 4) != 0) { bad = bad + 1; }
+    let is [2]u8 as hd;
+    hd[0] = cast(u8, 0xDA); hd[1] = cast(u8, 0x01);
+    let is bitreader.BitReader as hbr;
+    bitreader.br_init(&hbr, cast(*u8, &hd), 2);
+    if (huffman.huff_decode(&h, &hbr) != 0) { bad = bad + 1; }
+    if (huffman.huff_decode(&h, &hbr) != 1) { bad = bad + 1; }
+    if (huffman.huff_decode(&h, &hbr) != 2) { bad = bad + 1; }
+    if (huffman.huff_decode(&h, &hbr) != 3) { bad = bad + 1; }
+    huffman.huff_free(&h);
+
+    // checksums
+    if (checksum.crc32(cast(*u8, "123456789"), 9) != 0xCBF43926) { bad = bad + 1; }
+    if (checksum.adler32(cast(*u8, "Wikipedia"), 9) != 0x11E60398) { bad = bad + 1; }
+
+    if (bad == 0) { io.write_str(io.STDOUT, "  core ... PASS\n"); }
+    return bad;
+}
+
+fn suite_inflate() as i64 {
+    io.write_str(io.STDOUT, "[inflate]\n");
+    let is i64 as b with mut = 0;
+    b = b + check(0, "empty",    "tests/fixtures/empty.raw",    "tests/fixtures/empty.bin");
+    b = b + check(0, "one",      "tests/fixtures/one.raw",      "tests/fixtures/one.bin");
+    b = b + check(0, "hello",    "tests/fixtures/hello.raw",    "tests/fixtures/hello.bin");
+    b = b + check(0, "run",      "tests/fixtures/run.raw",      "tests/fixtures/run.bin");
+    b = b + check(0, "abc",      "tests/fixtures/abc.raw",      "tests/fixtures/abc.bin");
+    b = b + check(0, "lorem",    "tests/fixtures/lorem.raw",    "tests/fixtures/lorem.bin");
+    b = b + check(0, "binall",   "tests/fixtures/binall.raw",   "tests/fixtures/binall.bin");
+    b = b + check(0, "fixedlit", "tests/fixtures/fixedlit.raw", "tests/fixtures/fixedlit.bin");
+    b = b + check(0, "big",      "tests/fixtures/big.raw",      "tests/fixtures/big.bin");
+    b = b + check(0, "window",   "tests/fixtures/window.raw",   "tests/fixtures/window.bin");
+    return b;
+}
+
+fn suite_gzip() as i64 {
+    io.write_str(io.STDOUT, "[gzip/zlib]\n");
+    let is i64 as b with mut = 0;
+    b = b + check(1, "gz:hello",  "tests/fixtures/hello.gz",   "tests/fixtures/hello.bin");
+    b = b + check(1, "gz:lorem",  "tests/fixtures/lorem.gz",   "tests/fixtures/lorem.bin");
+    b = b + check(1, "gz:big",    "tests/fixtures/big.gz",     "tests/fixtures/big.bin");
+    b = b + check(1, "gz:window", "tests/fixtures/window.gz",  "tests/fixtures/window.bin");
+    b = b + check(1, "gz:system", "tests/fixtures/sysgzip.gz", "tests/fixtures/sysgzip.bin");
+    b = b + check(2, "zl:hello",  "tests/fixtures/hello.zlib", "tests/fixtures/hello.bin");
+    b = b + check(2, "zl:lorem",  "tests/fixtures/lorem.zlib", "tests/fixtures/lorem.bin");
+    b = b + check(2, "zl:big",    "tests/fixtures/big.zlib",   "tests/fixtures/big.bin");
+    return b;
+}
+
+// encode round-trips: compress with our encoder, decompress, compare.
+fn _rt(src as *u8, slen as i64, mode as i64) as i64 {
+    let is bytes.Bytes as comp = bytes.bytes_new(256);
+    let is i64 as cr with mut = 0;
+    if (mode == 0) { cr = deflate.deflate_compress(src, slen, &comp, 0); }
+    else if (mode == 1) { cr = deflate.deflate_compress(src, slen, &comp, 1); }
+    else if (mode == 2) { cr = gzip.gzip_compress(src, slen, &comp, 6); }
+    else { cr = zlib.zlib_compress(src, slen, &comp, 6); }
+    if (cr < 0) { bytes.bytes_free(&comp); return 0 - 1; }
+    let is bytes.Bytes as dec = bytes.bytes_new(256);
+    let is i64 as r with mut = 0;
+    if (mode <= 1) { r = inflate.inflate(comp.ptr, comp.len, &dec); }
+    else if (mode == 2) { r = gzip.gzip_decompress(comp.ptr, comp.len, &dec); }
+    else { r = zlib.zlib_decompress(comp.ptr, comp.len, &dec); }
+    let is i64 as ok with mut = 0;
+    if (r >= 0) { ok = _same(&dec, src, slen); }
+    bytes.bytes_free(&comp);
+    bytes.bytes_free(&dec);
+    if (ok == 1) { return 0; }
+    return 0 - 1;
+}
+
+fn rt_case(name as *u8, bin_path as *u8) as i64 {
+    io.write_str(io.STDOUT, "  ");
+    io.write_str(io.STDOUT, name);
+    let is i64 as slen with mut = 0;
+    let is *u8 as src = read_whole(bin_path, &slen);
+    if (cast(i64, src) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is i64 as bad with mut = 0;
+    if (_rt(src, slen, 0) != 0) { bad = 1; }
+    if (_rt(src, slen, 1) != 0) { bad = 1; }
+    if (_rt(src, slen, 2) != 0) { bad = 1; }
+    if (_rt(src, slen, 3) != 0) { bad = 1; }
+    if (bad == 0) { io.write_str(io.STDOUT, " ... PASS\n"); return 0; }
+    io.write_str(io.STDOUT, " ... FAIL\n");
+    return 1;
+}
+
+fn suite_deflate() as i64 {
+    io.write_str(io.STDOUT, "[encode roundtrip]\n");
+    let is i64 as b with mut = 0;
+    b = b + rt_case("empty",  "tests/fixtures/empty.bin");
+    b = b + rt_case("hello",  "tests/fixtures/hello.bin");
+    b = b + rt_case("run",    "tests/fixtures/run.bin");
+    b = b + rt_case("abc",    "tests/fixtures/abc.bin");
+    b = b + rt_case("lorem",  "tests/fixtures/lorem.bin");
+    b = b + rt_case("binall", "tests/fixtures/binall.bin");
+    b = b + rt_case("big",    "tests/fixtures/big.bin");
+    b = b + rt_case("window", "tests/fixtures/window.bin");
+    return b;
+}
+
+fn suite_lz4() as i64 {
+    io.write_str(io.STDOUT, "[lz4]\n");
+    let is i64 as b with mut = 0;
+    b = b + check(3, "empty",  "tests/fixtures/empty.lz4",  "tests/fixtures/empty.bin");
+    b = b + check(3, "hello",  "tests/fixtures/hello.lz4",  "tests/fixtures/hello.bin");
+    b = b + check(3, "lorem",  "tests/fixtures/lorem.lz4",  "tests/fixtures/lorem.bin");
+    b = b + check(3, "window", "tests/fixtures/window.lz4", "tests/fixtures/window.bin");
+    b = b + check(3, "big",    "tests/fixtures/big.lz4",    "tests/fixtures/big.bin");
+    b = b + check(3, "system", "tests/fixtures/syslz4.lz4", "tests/fixtures/syslz4.bin");
+    return b;
+}
+
+fn suite_snappy() as i64 {
+    io.write_str(io.STDOUT, "[snappy]\n");
+    let is i64 as b with mut = 0;
+    b = b + check(4, "empty",  "tests/fixtures/empty.sz",  "tests/fixtures/empty.bin");
+    b = b + check(4, "hello",  "tests/fixtures/hello.sz",  "tests/fixtures/hello.bin");
+    b = b + check(4, "lorem",  "tests/fixtures/lorem.sz",  "tests/fixtures/lorem.bin");
+    b = b + check(4, "window", "tests/fixtures/window.sz", "tests/fixtures/window.bin");
+    b = b + check(4, "snfar",  "tests/fixtures/snfar.sz",  "tests/fixtures/snfar.bin");
+    return b;
+}
+
+fn main() as i32 {
+    let is i64 as bad with mut = 0;
+    bad = bad + suite_core();
+    bad = bad + suite_inflate();
+    bad = bad + suite_gzip();
+    bad = bad + suite_deflate();
+    bad = bad + suite_lz4();
+    bad = bad + suite_snappy();
+    if (bad == 0) {
+        io.write_str(io.STDOUT, "\nall green\n");
+    } else {
+        io.write_str(io.STDOUT, "\nFAILURES: ");
+        io.write_int(io.STDOUT, bad);
+        io.write_str(io.STDOUT, "\n");
+    }
+    return cast(i32, bad);
+}

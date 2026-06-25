@@ -1,0 +1,58 @@
+// =======================================================
+// caustic-compact/core/bitwriter.cst
+// LSB-first bit writer over a Bytes buffer — the encode-side mirror of
+// bitreader. Header/extra bits are written LSB-first via bw_bits; Huffman
+// codes are written MSB-first via bw_huff (which reverses the code).
+// =======================================================
+
+use "../core/bytes.cst" as bytes;
+
+struct BitWriter {
+    out   as *bytes.Bytes;
+    acc   as i64;
+    nbits as i64;
+    err   as i64;   // 0 ok, <0 if an append failed
+}
+
+fn bw_init(bw as *BitWriter, out as *bytes.Bytes) as void {
+    bw.out = out;
+    bw.acc = 0;
+    bw.nbits = 0;
+    bw.err = 0;
+}
+
+// Write the low `n` bits of `value`, least-significant bit first.
+fn bw_bits(bw as *BitWriter, value as i64, n as i64) as void {
+    bw.acc = bw.acc | ((value & ((1 << n) - 1)) << bw.nbits);
+    bw.nbits = bw.nbits + n;
+    while (bw.nbits >= 8) {
+        if (bytes.bytes_push(bw.out, cast(u8, bw.acc & 0xFF)) < 0) { bw.err = 0 - 5; }
+        bw.acc = bw.acc >> 8;
+        bw.nbits = bw.nbits - 8;
+    }
+}
+
+// Reverse the low `n` bits of `code` (Huffman codes pack most-significant first).
+fn _rev(code as i64, n as i64) as i64 {
+    let is i64 as r with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        r = (r << 1) | ((code >> i) & 1);
+        i = i + 1;
+    }
+    return r;
+}
+
+// Write an `n`-bit Huffman code, most-significant bit first.
+fn bw_huff(bw as *BitWriter, code as i64, n as i64) as void {
+    bw_bits(bw, _rev(code, n), n);
+}
+
+// Flush a partial byte (zero-padded) to reach a byte boundary.
+fn bw_align(bw as *BitWriter) as void {
+    if (bw.nbits > 0) {
+        if (bytes.bytes_push(bw.out, cast(u8, bw.acc & 0xFF)) < 0) { bw.err = 0 - 5; }
+        bw.acc = 0;
+        bw.nbits = 0;
+    }
+}

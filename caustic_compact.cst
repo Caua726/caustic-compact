@@ -1,0 +1,25 @@
+// =======================================================
+// caustic-compact — pure-Caustic, zero-dependency (de)compression library.
+//
+//   use "caustic-compact/caustic_compact.cst" as cz;
+//   cz.gzip.gzip_decompress(...);  cz.inflate.inflate(...);
+//
+// Compile-check the whole tree (no main needed):
+//   caustic -c caustic_compact.cst
+//
+// One file per format under formats/; shared building blocks under core/.
+// Modules land phase by phase (see the plan); this list grows.
+// =======================================================
+
+use "core/errno.cst"     as errno;
+use "core/bytes.cst"     as bytes;
+use "core/bitreader.cst" as bitreader;
+use "core/huffman.cst"   as huffman;
+use "core/checksum.cst"  as checksum;
+use "core/bitwriter.cst" as bitwriter;
+use "formats/inflate.cst" as inflate;
+use "formats/deflate.cst" as deflate;
+use "formats/zlib.cst"    as zlib;
+use "formats/gzip.cst"    as gzip;
+use "formats/lz4.cst"     as lz4;
+use "formats/snappy.cst"  as snappy;

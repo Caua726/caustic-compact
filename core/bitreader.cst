@@ -1,0 +1,63 @@
+// =======================================================
+// caustic-compact/core/bitreader.cst
+// LSB-first bit reader for DEFLATE/zlib/gzip. Bits are pulled from the
+// source bytes least-significant-bit first and accumulated in an i64.
+// The accumulator is kept below 2^56 (never touches the sign bit), so
+// `>>` behaves as a logical shift and all masks are exact.
+// =======================================================
+
+use "errno.cst" as errno;
+
+struct BitReader {
+    src   as *u8;   // source bytes
+    len   as i64;   // total source length
+    pos   as i64;   // next unread byte index
+    acc   as i64;   // bit accumulator (LSB = next bit out)
+    nbits as i64;   // number of valid bits currently in acc
+}
+
+fn br_init(br as *BitReader, src as *u8, len as i64) as void {
+    br.src = src;
+    br.len = len;
+    br.pos = 0;
+    br.acc = 0;
+    br.nbits = 0;
+}
+
+// Ensure at least `need` bits are buffered (need <= 48).
+// Returns 0 on success, Z_EOF if the stream runs out before `need`.
+fn br_need(br as *BitReader, need as i64) as i64 {
+    while (br.nbits < need) {
+        if (br.pos >= br.len) { return errno.Z_EOF; }
+        let is i64 as b = cast(i64, br.src[br.pos]);   // 0..255, zero-extended
+        br.pos = br.pos + 1;
+        br.acc = br.acc | (b << br.nbits);             // LSB-first packing
+        br.nbits = br.nbits + 8;
+    }
+    return 0;
+}
+
+// Read `n` bits LSB-first (0 <= n <= 24) as an integer.
+// On EOF returns Z_EOF (a real value is always 0..2^n-1, never negative).
+fn br_get(br as *BitReader, n as i64) as i64 {
+    if (n == 0) { return 0; }
+    if (br_need(br, n) < 0) { return errno.Z_EOF; }
+    let is i64 as v = br.acc & ((1 << n) - 1);
+    br.acc = br.acc >> n;
+    br.nbits = br.nbits - n;
+    return v;
+}
+
+// Discard buffered bits down to the next byte boundary (stored blocks).
+fn br_align(br as *BitReader) as void {
+    let is i64 as drop = br.nbits & 7;
+    br.acc = br.acc >> drop;
+    br.nbits = br.nbits - drop;
+}
+
+// Bytes already fully consumed from the source (for trailer parsing).
+// After a byte boundary, whole buffered bytes are pushed back conceptually:
+// callers that need the trailer should br_align first, then read via br_get(8).
+fn br_bytepos(br as *BitReader) as i64 {
+    return br.pos - (br.nbits >> 3);
+}

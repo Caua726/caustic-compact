@@ -1,0 +1,15 @@
+// =======================================================
+// caustic-compact/core/errno.cst
+// Error codes for the whole library. Every decode/encode entry point
+// returns a non-negative count on success or one of these negative codes
+// on failure (same -errno convention as caustic-net). No Result/Option.
+// =======================================================
+
+let is i64 as Z_EOF     with imut = 0 - 1;   // input truncated / ran out of bits
+let is i64 as Z_BADTYPE with imut = 0 - 2;   // reserved/invalid block or frame type
+let is i64 as Z_BADHUFF with imut = 0 - 3;   // invalid / over-subscribed Huffman code
+let is i64 as Z_BADDIST with imut = 0 - 4;   // back-reference points before output start
+let is i64 as Z_OOM     with imut = 0 - 5;   // allocation failed
+let is i64 as Z_BADLEN  with imut = 0 - 6;   // stored block LEN != ~NLEN
+let is i64 as Z_BADHDR  with imut = 0 - 7;   // bad container header (gzip/zlib magic/flags)
+let is i64 as Z_BADSUM  with imut = 0 - 8;   // checksum / size mismatch in trailer

@@ -1,0 +1,92 @@
+// =======================================================
+// caustic-compact/formats/gzip.cst
+// gzip container (RFC 1952): 10-byte base header (+ optional EXTRA/NAME/
+// COMMENT/HCRC fields) + raw DEFLATE + 8-byte trailer (CRC-32 then ISIZE,
+// both little-endian). This is HTTP `Content-Encoding: gzip`.
+//   gzip_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "../core/checksum.cst" as checksum;
+use "inflate.cst" as inflate;
+use "deflate.cst" as deflate;
+
+// Little-endian 32-bit read (gzip trailer fields are LSB first).
+fn _le32(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8)
+         | (cast(i64, p[off + 2]) << 16) | (cast(i64, p[off + 3]) << 24);
+}
+
+fn gzip_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (src_len < 18) { return errno.Z_BADHDR; }
+    if (cast(i64, src[0]) != 0x1F) { return errno.Z_BADHDR; }
+    if (cast(i64, src[1]) != 0x8B) { return errno.Z_BADHDR; }
+    if (cast(i64, src[2]) != 8) { return errno.Z_BADHDR; }     // CM must be deflate
+    let is i64 as flg = cast(i64, src[3]);
+
+    let is i64 as pos with mut = 10;   // skip MTIME(4) + XFL(1) + OS(1)
+
+    if ((flg & 4) != 0) {              // FEXTRA: 2-byte length + payload
+        if (pos + 2 > src_len) { return errno.Z_BADHDR; }
+        let is i64 as xlen = cast(i64, src[pos]) | (cast(i64, src[pos + 1]) << 8);
+        pos = pos + 2 + xlen;
+    }
+    if ((flg & 8) != 0) {              // FNAME: zero-terminated
+        while (pos < src_len) {
+            let is i64 as c = cast(i64, src[pos]);
+            pos = pos + 1;
+            if (c == 0) { break; }
+        }
+    }
+    if ((flg & 16) != 0) {             // FCOMMENT: zero-terminated
+        while (pos < src_len) {
+            let is i64 as c = cast(i64, src[pos]);
+            pos = pos + 1;
+            if (c == 0) { break; }
+        }
+    }
+    if ((flg & 2) != 0) {              // FHCRC: 2-byte header CRC (skip)
+        pos = pos + 2;
+    }
+    if (pos > src_len - 8) { return errno.Z_BADHDR; }
+
+    let is *u8 as body = cast(*u8, cast(i64, src) + pos);
+    let is i64 as body_len = src_len - 8 - pos;
+    let is i64 as r = inflate.inflate(body, body_len, out);
+    if (r < 0) { return r; }
+
+    let is i64 as stored_crc = _le32(src, src_len - 8);
+    let is i64 as stored_isize = _le32(src, src_len - 4);
+    let is i64 as got_crc = checksum.crc32(out.ptr, out.len);
+    if (got_crc != stored_crc) { return errno.Z_BADSUM; }
+    if ((out.len & 0xFFFFFFFF) != stored_isize) { return errno.Z_BADSUM; }
+    return out.len;
+}
+
+// Compress `src` into a gzip stream appended to `out` (HTTP Content-Encoding: gzip).
+fn gzip_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    bytes.bytes_push(out, cast(u8, 0x1F));   // ID1
+    bytes.bytes_push(out, cast(u8, 0x8B));   // ID2
+    bytes.bytes_push(out, cast(u8, 8));      // CM = deflate
+    bytes.bytes_push(out, cast(u8, 0));      // FLG = 0
+    bytes.bytes_push(out, cast(u8, 0));      // MTIME (4 bytes, zero)
+    bytes.bytes_push(out, cast(u8, 0));
+    bytes.bytes_push(out, cast(u8, 0));
+    bytes.bytes_push(out, cast(u8, 0));
+    bytes.bytes_push(out, cast(u8, 0));      // XFL
+    bytes.bytes_push(out, cast(u8, 255));    // OS = unknown
+    let is i64 as r = deflate.deflate_compress(src, src_len, out, level);
+    if (r < 0) { return r; }
+    let is i64 as crc = checksum.crc32(src, src_len);
+    let is i64 as isize = src_len & 0xFFFFFFFF;
+    bytes.bytes_push(out, cast(u8, crc & 0xFF));            // CRC-32, little-endian
+    bytes.bytes_push(out, cast(u8, (crc >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (crc >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (crc >> 24) & 0xFF));
+    bytes.bytes_push(out, cast(u8, isize & 0xFF));          // ISIZE, little-endian
+    bytes.bytes_push(out, cast(u8, (isize >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (isize >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (isize >> 24) & 0xFF));
+    return out.len;
+}

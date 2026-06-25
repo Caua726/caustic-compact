@@ -1,0 +1,146 @@
+// =======================================================
+// caustic-compact/core/checksum.cst
+// CRC-32 (IEEE, gzip trailer) and Adler-32 (zlib trailer).
+// Both return the 32-bit result as an i64 in 0..2^32-1.
+// CRC table is built once on first use (no array literals in Caustic).
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _c_alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(8192); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+// --- CRC-32 -------------------------------------------------------------
+
+let is *i64 as _crc_table with mut;
+let is i32 as _crc_ready with mut = 0;
+
+fn _crc_init() as void {
+    if (_crc_ready == 1) { return; }
+    _crc_table = cast(*i64, _c_alloc(256 * 8));
+    let is i64 as n with mut = 0;
+    while (n < 256) {
+        let is i64 as c with mut = n;
+        let is i64 as k with mut = 0;
+        while (k < 8) {
+            if ((c & 1) == 1) { c = 0xEDB88320 ^ (c >> 1); }
+            else { c = c >> 1; }
+            k = k + 1;
+        }
+        _crc_table[n] = c;
+        n = n + 1;
+    }
+    _crc_ready = 1;
+}
+
+// Continue a running CRC. Pass crc=0 for a fresh computation.
+fn crc32_update(crc as i64, buf as *u8, n as i64) as i64 {
+    _crc_init();
+    let is i64 as c with mut = crc ^ 0xFFFFFFFF;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as idx = (c ^ cast(i64, buf[i])) & 0xFF;
+        c = _crc_table[idx] ^ (c >> 8);
+        i = i + 1;
+    }
+    return c ^ 0xFFFFFFFF;
+}
+
+// One-shot CRC-32 of a buffer.
+fn crc32(buf as *u8, n as i64) as i64 {
+    return crc32_update(0, buf, n);
+}
+
+// --- Adler-32 -----------------------------------------------------------
+
+let is i64 as _ADLER_MOD with imut = 65521;
+
+// Continue a running Adler-32. Pass adler=1 for a fresh computation.
+fn adler32_update(adler as i64, buf as *u8, n as i64) as i64 {
+    let is i64 as a with mut = adler & 0xFFFF;
+    let is i64 as b with mut = (adler >> 16) & 0xFFFF;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        a = a + cast(i64, buf[i]);
+        if (a >= _ADLER_MOD) { a = a - _ADLER_MOD; }
+        b = b + a;
+        if (b >= _ADLER_MOD) { b = b - _ADLER_MOD; }
+        i = i + 1;
+    }
+    return (b << 16) | a;
+}
+
+// One-shot Adler-32 of a buffer.
+fn adler32(buf as *u8, n as i64) as i64 {
+    return adler32_update(1, buf, n);
+}
+
+// --- xxHash32 (LZ4 frame checksums) ------------------------------------
+// All arithmetic is mod 2^32; we mask to 32 bits before every rotate/shift.
+// Caustic i64 multiply wraps mod 2^64, so the low 32 bits stay exact.
+let is i64 as _XXP1 with imut = 2654435761;
+let is i64 as _XXP2 with imut = 2246822519;
+let is i64 as _XXP3 with imut = 3266489917;
+let is i64 as _XXP4 with imut = 668265263;
+let is i64 as _XXP5 with imut = 374761393;
+
+fn _rotl32(x as i64, r as i64) as i64 {
+    let is i64 as xm = x & 0xFFFFFFFF;
+    return ((xm << r) | (xm >> (32 - r))) & 0xFFFFFFFF;
+}
+
+fn _xx_rd32(buf as *u8, off as i64) as i64 {
+    return cast(i64, buf[off]) | (cast(i64, buf[off + 1]) << 8)
+         | (cast(i64, buf[off + 2]) << 16) | (cast(i64, buf[off + 3]) << 24);
+}
+
+fn _xx_round(acc as i64, input as i64) as i64 {
+    let is i64 as a with mut = (acc + (input * _XXP2)) & 0xFFFFFFFF;
+    a = _rotl32(a, 13);
+    return (a * _XXP1) & 0xFFFFFFFF;
+}
+
+fn xxhash32(buf as *u8, len as i64) as i64 {
+    let is i64 as p with mut = 0;
+    let is i64 as h with mut = 0;
+    if (len >= 16) {
+        let is i64 as v1 with mut = (_XXP1 + _XXP2) & 0xFFFFFFFF;
+        let is i64 as v2 with mut = _XXP2;
+        let is i64 as v3 with mut = 0;
+        let is i64 as v4 with mut = (0 - _XXP1) & 0xFFFFFFFF;
+        let is i64 as limit = len - 16;
+        while (p <= limit) {
+            v1 = _xx_round(v1, _xx_rd32(buf, p)); p = p + 4;
+            v2 = _xx_round(v2, _xx_rd32(buf, p)); p = p + 4;
+            v3 = _xx_round(v3, _xx_rd32(buf, p)); p = p + 4;
+            v4 = _xx_round(v4, _xx_rd32(buf, p)); p = p + 4;
+        }
+        h = (_rotl32(v1, 1) + _rotl32(v2, 7) + _rotl32(v3, 12) + _rotl32(v4, 18)) & 0xFFFFFFFF;
+    } else {
+        h = _XXP5;
+    }
+    h = (h + len) & 0xFFFFFFFF;
+    while (p + 4 <= len) {
+        h = (h + (_xx_rd32(buf, p) * _XXP3)) & 0xFFFFFFFF;
+        h = _rotl32(h, 17);
+        h = (h * _XXP4) & 0xFFFFFFFF;
+        p = p + 4;
+    }
+    while (p < len) {
+        h = (h + (cast(i64, buf[p]) * _XXP5)) & 0xFFFFFFFF;
+        h = _rotl32(h, 11);
+        h = (h * _XXP1) & 0xFFFFFFFF;
+        p = p + 1;
+    }
+    h = h ^ (h >> 15);
+    h = (h * _XXP2) & 0xFFFFFFFF;
+    h = h ^ (h >> 13);
+    h = (h * _XXP3) & 0xFFFFFFFF;
+    h = h ^ (h >> 16);
+    return h & 0xFFFFFFFF;
+}

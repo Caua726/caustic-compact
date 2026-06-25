@@ -1,0 +1,26 @@
+name "caustic-compact"
+version "0.0.1"
+author "Caua"
+
+target "runtests" {
+    src "tests/run.cst"
+    out "tests/runtests"
+}
+
+target "zcat" {
+    src "examples/zcat.cst"
+    out "build/zcat"
+}
+
+target "gzc" {
+    src "examples/gzc.cst"
+    out "build/gzc"
+}
+
+script "test" {
+    "tests/runtests"
+}
+
+script "clean" {
+    "rm -rf .caustic build"
+}

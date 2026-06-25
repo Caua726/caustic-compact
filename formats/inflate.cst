@@ -1,0 +1,284 @@
+// =======================================================
+// caustic-compact/formats/inflate.cst
+// DEFLATE decompression (RFC 1951). Decodes the three block types
+// (stored / fixed-Huffman / dynamic-Huffman) into a growable Bytes buffer.
+//   inflate(src, src_len, out) -> bytes written, or a negative error code.
+// This is the keystone: zlib, gzip and PNG all decode through it.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "../core/bitreader.cst" as bitreader;
+use "../core/huffman.cst" as huffman;
+use "std/mem.cst" only bins, core as mem;
+
+// --- constant tables (no array literals in Caustic; filled once) --------
+
+let is mem.Bins as _bins with mut;
+let is i32 as _bins_ready with mut = 0;
+fn _i_alloc(size as i64) as *i64 {
+    if (_bins_ready == 0) { _bins = mem.bins.bins_new(8192); _bins_ready = 1; }
+    return cast(*i64, mem.bins.bins_alloc(&_bins, size));
+}
+
+let is *i64 as LBASE  with mut;    // length base for symbols 257..285
+let is *i64 as LEXTRA with mut;    // length extra bits
+let is *i64 as DBASE  with mut;    // distance base for symbols 0..29
+let is *i64 as DEXTRA with mut;    // distance extra bits
+let is *i64 as CLORDER with mut;   // code-length-code symbol order
+let is i32 as _tables_ready with mut = 0;
+
+fn _tables_init() as i64 {
+    if (_tables_ready == 1) { return 0; }
+    LBASE   = _i_alloc(29 * 8);
+    LEXTRA  = _i_alloc(29 * 8);
+    DBASE   = _i_alloc(30 * 8);
+    DEXTRA  = _i_alloc(30 * 8);
+    CLORDER = _i_alloc(19 * 8);
+    if (cast(i64, LBASE) == 0) { return errno.Z_OOM; }
+    if (cast(i64, CLORDER) == 0) { return errno.Z_OOM; }
+
+    LBASE[0]=3;   LBASE[1]=4;   LBASE[2]=5;   LBASE[3]=6;   LBASE[4]=7;
+    LBASE[5]=8;   LBASE[6]=9;   LBASE[7]=10;  LBASE[8]=11;  LBASE[9]=13;
+    LBASE[10]=15; LBASE[11]=17; LBASE[12]=19; LBASE[13]=23; LBASE[14]=27;
+    LBASE[15]=31; LBASE[16]=35; LBASE[17]=43; LBASE[18]=51; LBASE[19]=59;
+    LBASE[20]=67; LBASE[21]=83; LBASE[22]=99; LBASE[23]=115; LBASE[24]=131;
+    LBASE[25]=163; LBASE[26]=195; LBASE[27]=227; LBASE[28]=258;
+
+    LEXTRA[0]=0;  LEXTRA[1]=0;  LEXTRA[2]=0;  LEXTRA[3]=0;  LEXTRA[4]=0;
+    LEXTRA[5]=0;  LEXTRA[6]=0;  LEXTRA[7]=0;  LEXTRA[8]=1;  LEXTRA[9]=1;
+    LEXTRA[10]=1; LEXTRA[11]=1; LEXTRA[12]=2; LEXTRA[13]=2; LEXTRA[14]=2;
+    LEXTRA[15]=2; LEXTRA[16]=3; LEXTRA[17]=3; LEXTRA[18]=3; LEXTRA[19]=3;
+    LEXTRA[20]=4; LEXTRA[21]=4; LEXTRA[22]=4; LEXTRA[23]=4; LEXTRA[24]=5;
+    LEXTRA[25]=5; LEXTRA[26]=5; LEXTRA[27]=5; LEXTRA[28]=0;
+
+    DBASE[0]=1;    DBASE[1]=2;    DBASE[2]=3;    DBASE[3]=4;    DBASE[4]=5;
+    DBASE[5]=7;    DBASE[6]=9;    DBASE[7]=13;   DBASE[8]=17;   DBASE[9]=25;
+    DBASE[10]=33;  DBASE[11]=49;  DBASE[12]=65;  DBASE[13]=97;  DBASE[14]=129;
+    DBASE[15]=193; DBASE[16]=257; DBASE[17]=385; DBASE[18]=513; DBASE[19]=769;
+    DBASE[20]=1025; DBASE[21]=1537; DBASE[22]=2049; DBASE[23]=3073;
+    DBASE[24]=4097; DBASE[25]=6145; DBASE[26]=8193; DBASE[27]=12289;
+    DBASE[28]=16385; DBASE[29]=24577;
+
+    DEXTRA[0]=0;   DEXTRA[1]=0;   DEXTRA[2]=0;   DEXTRA[3]=0;   DEXTRA[4]=1;
+    DEXTRA[5]=1;   DEXTRA[6]=2;   DEXTRA[7]=2;   DEXTRA[8]=3;   DEXTRA[9]=3;
+    DEXTRA[10]=4;  DEXTRA[11]=4;  DEXTRA[12]=5;  DEXTRA[13]=5;  DEXTRA[14]=6;
+    DEXTRA[15]=6;  DEXTRA[16]=7;  DEXTRA[17]=7;  DEXTRA[18]=8;  DEXTRA[19]=8;
+    DEXTRA[20]=9;  DEXTRA[21]=9;  DEXTRA[22]=10; DEXTRA[23]=10; DEXTRA[24]=11;
+    DEXTRA[25]=11; DEXTRA[26]=12; DEXTRA[27]=12; DEXTRA[28]=13; DEXTRA[29]=13;
+
+    CLORDER[0]=16; CLORDER[1]=17; CLORDER[2]=18; CLORDER[3]=0;  CLORDER[4]=8;
+    CLORDER[5]=7;  CLORDER[6]=9;  CLORDER[7]=6;  CLORDER[8]=10; CLORDER[9]=5;
+    CLORDER[10]=11; CLORDER[11]=4; CLORDER[12]=12; CLORDER[13]=3; CLORDER[14]=13;
+    CLORDER[15]=2; CLORDER[16]=14; CLORDER[17]=1; CLORDER[18]=15;
+
+    _tables_ready = 1;
+    return 0;
+}
+
+// --- overlap-safe LZ77 back-reference copy into the output tail ---------
+// Copies `length` bytes from `dist` back, byte-by-byte so that runs
+// (dist < length) propagate correctly. Never memcpy here.
+fn _lz_copy(out as *bytes.Bytes, dist as i64, length as i64) as i64 {
+    if (dist > out.len) { return errno.Z_BADDIST; }
+    if (bytes.bytes_reserve(out, length) < 0) { return errno.Z_OOM; }
+    let is i64 as src with mut = out.len - dist;
+    let is i64 as dst with mut = out.len;
+    let is i64 as end = out.len + length;
+    while (dst < end) {
+        out.ptr[dst] = out.ptr[src];
+        src = src + 1;
+        dst = dst + 1;
+    }
+    out.len = end;
+    return length;
+}
+
+// --- stored block (BTYPE 00) -------------------------------------------
+fn _inflate_stored(br as *bitreader.BitReader, out as *bytes.Bytes) as i64 {
+    bitreader.br_align(br);
+    let is i64 as len  = bitreader.br_get(br, 16);
+    let is i64 as nlen = bitreader.br_get(br, 16);
+    if (len < 0) { return errno.Z_EOF; }
+    if (nlen < 0) { return errno.Z_EOF; }
+    if ((len ^ 0xFFFF) != nlen) { return errno.Z_BADLEN; }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is i64 as b = bitreader.br_get(br, 8);
+        if (b < 0) { return errno.Z_EOF; }
+        if (bytes.bytes_push(out, cast(u8, b)) < 0) { return errno.Z_OOM; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- shared symbol loop for fixed/dynamic Huffman blocks ----------------
+fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
+                          lit as *huffman.Huff, dist as *huffman.Huff) as i64 {
+    let is i64 as sym with mut = huffman.huff_decode(lit, br);
+    while (sym != 256) {
+        if (sym < 0) { return sym; }
+        if (sym < 256) {
+            if (bytes.bytes_push(out, cast(u8, sym)) < 0) { return errno.Z_OOM; }
+        } else {
+            let is i64 as li = sym - 257;
+            if (li >= 29) { return errno.Z_BADHUFF; }
+            let is i64 as eb = bitreader.br_get(br, LEXTRA[li]);
+            if (eb < 0) { return errno.Z_EOF; }
+            let is i64 as length = LBASE[li] + eb;
+            let is i64 as dsym = huffman.huff_decode(dist, br);
+            if (dsym < 0) { return dsym; }
+            if (dsym >= 30) { return errno.Z_BADDIST; }
+            let is i64 as deb = bitreader.br_get(br, DEXTRA[dsym]);
+            if (deb < 0) { return errno.Z_EOF; }
+            let is i64 as distance = DBASE[dsym] + deb;
+            let is i64 as cr = _lz_copy(out, distance, length);
+            if (cr < 0) { return cr; }
+        }
+        sym = huffman.huff_decode(lit, br);
+    }
+    return 0;
+}
+
+// --- fixed Huffman block (BTYPE 01) ------------------------------------
+fn _build_fixed(lit_h as *huffman.Huff, dist_h as *huffman.Huff) as i64 {
+    let is [288]i64 as ll;
+    let is i64 as i with mut = 0;
+    while (i < 144) { ll[i] = 8; i = i + 1; }
+    while (i < 256) { ll[i] = 9; i = i + 1; }
+    while (i < 280) { ll[i] = 7; i = i + 1; }
+    while (i < 288) { ll[i] = 8; i = i + 1; }
+    let is i64 as r1 = huffman.huff_build(lit_h, cast(*i64, &ll), 288);
+    if (r1 != 0) { return r1; }
+    let is [30]i64 as dl;
+    i = 0;
+    while (i < 30) { dl[i] = 5; i = i + 1; }
+    let is i64 as r2 = huffman.huff_build(dist_h, cast(*i64, &dl), 30);
+    if (r2 != 0) { return r2; }
+    return 0;
+}
+
+fn _inflate_fixed(br as *bitreader.BitReader, out as *bytes.Bytes) as i64 {
+    let is huffman.Huff as lit_h;
+    let is huffman.Huff as dist_h;
+    let is i64 as rb = _build_fixed(&lit_h, &dist_h);
+    if (rb != 0) { return rb; }
+    let is i64 as r = _inflate_huffman_block(br, out, &lit_h, &dist_h);
+    huffman.huff_free(&lit_h);
+    huffman.huff_free(&dist_h);
+    return r;
+}
+
+// --- dynamic Huffman block (BTYPE 10) ----------------------------------
+fn _inflate_dynamic(br as *bitreader.BitReader, out as *bytes.Bytes) as i64 {
+    let is i64 as hlit with mut = bitreader.br_get(br, 5);
+    let is i64 as hdist with mut = bitreader.br_get(br, 5);
+    let is i64 as hclen with mut = bitreader.br_get(br, 4);
+    if (hlit < 0) { return errno.Z_EOF; }
+    if (hdist < 0) { return errno.Z_EOF; }
+    if (hclen < 0) { return errno.Z_EOF; }
+    hlit = hlit + 257;
+    hdist = hdist + 1;
+    hclen = hclen + 4;
+
+    // code-length-code lengths, placed in CLORDER positions
+    let is [19]i64 as cl_lens;
+    let is i64 as i with mut = 0;
+    while (i < 19) { cl_lens[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < hclen) {
+        let is i64 as v = bitreader.br_get(br, 3);
+        if (v < 0) { return errno.Z_EOF; }
+        cl_lens[CLORDER[i]] = v;
+        i = i + 1;
+    }
+    let is huffman.Huff as cl_h;
+    let is i64 as rb = huffman.huff_build(&cl_h, cast(*i64, &cl_lens), 19);
+    if (rb != 0) { return rb; }
+
+    // RLE-decode the combined lit/len + dist code lengths
+    let is i64 as total = hlit + hdist;
+    let is [320]i64 as all_lens;
+    let is i64 as n with mut = 0;
+    while (n < total) {
+        let is i64 as sym = huffman.huff_decode(&cl_h, br);
+        if (sym < 0) { huffman.huff_free(&cl_h); return sym; }
+        if (sym < 16) {
+            all_lens[n] = sym;
+            n = n + 1;
+        } else if (sym == 16) {
+            if (n == 0) { huffman.huff_free(&cl_h); return errno.Z_BADHUFF; }
+            let is i64 as rep1 with mut = bitreader.br_get(br, 2);
+            if (rep1 < 0) { huffman.huff_free(&cl_h); return errno.Z_EOF; }
+            rep1 = rep1 + 3;
+            let is i64 as prev = all_lens[n - 1];
+            let is i64 as j with mut = 0;
+            while (j < rep1) {
+                if (n >= total) { huffman.huff_free(&cl_h); return errno.Z_BADHUFF; }
+                all_lens[n] = prev;
+                n = n + 1;
+                j = j + 1;
+            }
+        } else if (sym == 17) {
+            let is i64 as rep2 with mut = bitreader.br_get(br, 3);
+            if (rep2 < 0) { huffman.huff_free(&cl_h); return errno.Z_EOF; }
+            rep2 = rep2 + 3;
+            let is i64 as j2 with mut = 0;
+            while (j2 < rep2) {
+                if (n >= total) { huffman.huff_free(&cl_h); return errno.Z_BADHUFF; }
+                all_lens[n] = 0;
+                n = n + 1;
+                j2 = j2 + 1;
+            }
+        } else {
+            let is i64 as rep3 with mut = bitreader.br_get(br, 7);
+            if (rep3 < 0) { huffman.huff_free(&cl_h); return errno.Z_EOF; }
+            rep3 = rep3 + 11;
+            let is i64 as j3 with mut = 0;
+            while (j3 < rep3) {
+                if (n >= total) { huffman.huff_free(&cl_h); return errno.Z_BADHUFF; }
+                all_lens[n] = 0;
+                n = n + 1;
+                j3 = j3 + 1;
+            }
+        }
+    }
+    huffman.huff_free(&cl_h);
+
+    // split and build the two block tables
+    let is huffman.Huff as lit_h;
+    let is huffman.Huff as dist_h;
+    let is i64 as r1 = huffman.huff_build(&lit_h, cast(*i64, &all_lens), hlit);
+    if (r1 != 0) { return r1; }
+    let is *i64 as dist_ptr = cast(*i64, cast(i64, &all_lens) + hlit * 8);
+    let is i64 as r2 = huffman.huff_build(&dist_h, dist_ptr, hdist);
+    if (r2 != 0) { huffman.huff_free(&lit_h); return r2; }
+
+    let is i64 as r3 = _inflate_huffman_block(br, out, &lit_h, &dist_h);
+    huffman.huff_free(&lit_h);
+    huffman.huff_free(&dist_h);
+    return r3;
+}
+
+// --- top-level: decompress a raw DEFLATE stream ------------------------
+fn inflate(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (_tables_init() < 0) { return errno.Z_OOM; }
+    let is bitreader.BitReader as br;
+    bitreader.br_init(&br, src, src_len);
+
+    let is i64 as bfinal with mut = 0;
+    while (bfinal == 0) {
+        let is i64 as bf = bitreader.br_get(&br, 1);
+        let is i64 as bt = bitreader.br_get(&br, 2);
+        if (bf < 0) { return errno.Z_EOF; }
+        if (bt < 0) { return errno.Z_EOF; }
+        bfinal = bf;
+        let is i64 as r with mut = 0;
+        if (bt == 0) { r = _inflate_stored(&br, out); }
+        else if (bt == 1) { r = _inflate_fixed(&br, out); }
+        else if (bt == 2) { r = _inflate_dynamic(&br, out); }
+        else { return errno.Z_BADTYPE; }
+        if (r < 0) { return r; }
+    }
+    return out.len;
+}

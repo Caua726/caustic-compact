@@ -1,0 +1,117 @@
+// =======================================================
+// caustic-compact/core/huffman.cst
+// Canonical Huffman decoding for DEFLATE (RFC 1951 §3.2.2).
+// A table is built from a per-symbol code-length array; decoding walks
+// the stream one bit at a time, comparing the code being built against
+// the first canonical code of each length (the classic puff.c method).
+// Correctness-first; a flat lookup table can later slot in behind the
+// same huff_decode signature.
+// =======================================================
+
+use "errno.cst" as errno;
+use "bitreader.cst" as bitreader;
+use "std/mem.cst" only bins, core as mem;
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _h_alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn _h_free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
+// count[len]  : number of symbols having each code length (len 0..15)
+// symbol[]    : symbols sorted by (length, symbol) — the decode order
+struct Huff {
+    count  as *i64;   // 16 entries
+    symbol as *i64;   // n entries
+    n      as i64;    // alphabet size
+}
+
+// Build a canonical Huffman table from `lengths` (one entry per symbol,
+// value 0..15; 0 = symbol absent). Returns 0 ok, Z_OOM, or Z_BADHUFF if
+// the code set is over-subscribed. Incomplete codes are tolerated (DEFLATE
+// allows a single-symbol distance code); decode relies on length bounds.
+fn huff_build(h as *Huff, lengths as *i64, n as i64) as i64 {
+    h.n = n;
+    h.count  = cast(*i64, _h_alloc(16 * 8));
+    h.symbol = cast(*i64, _h_alloc(n * 8));
+    if (cast(i64, h.count) == 0) { return errno.Z_OOM; }
+    if (cast(i64, h.symbol) == 0) { return errno.Z_OOM; }
+
+    let is i64 as i with mut = 0;
+    while (i < 16) { h.count[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < n) {
+        let is i64 as L = lengths[i];
+        h.count[L] = h.count[L] + 1;
+        i = i + 1;
+    }
+    h.count[0] = 0;   // length-0 symbols are not part of the code
+
+    // Validate against over-subscription.
+    let is i64 as left with mut = 1;
+    let is i64 as cl with mut = 1;
+    while (cl < 16) {
+        left = left << 1;
+        left = left - h.count[cl];
+        if (left < 0) { return errno.Z_BADHUFF; }
+        cl = cl + 1;
+    }
+
+    // Per-length starting offset into symbol[].
+    let is [16]i64 as offs;
+    offs[1] = 0;
+    let is i64 as L2 with mut = 1;
+    while (L2 < 15) {
+        offs[L2 + 1] = offs[L2] + h.count[L2];
+        L2 = L2 + 1;
+    }
+
+    // Place each used symbol in canonical order.
+    i = 0;
+    while (i < n) {
+        let is i64 as li = lengths[i];
+        if (li != 0) {
+            h.symbol[offs[li]] = i;
+            offs[li] = offs[li] + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn huff_free(h as *Huff) as void {
+    if (cast(i64, h.count) != 0) { _h_free(cast(*u8, h.count)); }
+    if (cast(i64, h.symbol) != 0) { _h_free(cast(*u8, h.symbol)); }
+    h.count = cast(*i64, 0);
+    h.symbol = cast(*i64, 0);
+    h.n = 0;
+}
+
+// Decode one symbol from the stream. Returns the symbol (>=0), or
+// Z_BADHUFF on an invalid code, or Z_EOF if the input is truncated.
+fn huff_decode(h as *Huff, br as *bitreader.BitReader) as i64 {
+    let is i64 as code  with mut = 0;
+    let is i64 as first with mut = 0;
+    let is i64 as index with mut = 0;
+    let is i64 as L with mut = 1;
+    while (L < 16) {
+        let is i64 as bit = bitreader.br_get(br, 1);
+        if (bit < 0) { return errno.Z_EOF; }
+        code = code | bit;
+        let is i64 as cnt = h.count[L];
+        if (code - first < cnt) {
+            return h.symbol[index + (code - first)];
+        }
+        index = index + cnt;
+        first = (first + cnt) << 1;
+        code = code << 1;
+        L = L + 1;
+    }
+    return errno.Z_BADHUFF;
+}

@@ -1,0 +1,97 @@
+// =======================================================
+// caustic-compact/formats/snappy.cst
+// Snappy decompression (the raw block format). A varint preamble gives the
+// uncompressed length, followed by elements: literals (tag type 0) and
+// back-reference copies (types 1/2/3 with 1/2/4-byte offsets). Copies are
+// overlap-safe.
+//   snappy_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+
+fn _copy_back(out as *bytes.Bytes, offset as i64, length as i64) as i64 {
+    if (offset > out.len) { return errno.Z_BADDIST; }
+    if (offset == 0) { return errno.Z_BADDIST; }
+    if (bytes.bytes_reserve(out, length) < 0) { return errno.Z_OOM; }
+    let is i64 as s with mut = out.len - offset;
+    let is i64 as d with mut = out.len;
+    let is i64 as e = out.len + length;
+    while (d < e) {
+        out.ptr[d] = out.ptr[s];
+        s = s + 1;
+        d = d + 1;
+    }
+    out.len = e;
+    return 0;
+}
+
+fn snappy_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    // varint preamble: uncompressed length (LSB groups of 7 bits)
+    let is i64 as pos with mut = 0;
+    let is i64 as ulen with mut = 0;
+    let is i64 as shift with mut = 0;
+    while (pos < src_len) {
+        let is i64 as b = cast(i64, src[pos]);
+        pos = pos + 1;
+        ulen = ulen | ((b & 0x7F) << shift);
+        shift = shift + 7;
+        if ((b & 0x80) == 0) { break; }
+    }
+    if (ulen > 0) {
+        if (bytes.bytes_reserve(out, ulen) < 0) { return errno.Z_OOM; }
+    }
+
+    while (pos < src_len) {
+        let is i64 as tag = cast(i64, src[pos]);
+        pos = pos + 1;
+        let is i64 as typ = tag & 3;
+
+        if (typ == 0) {
+            let is i64 as lf = tag >> 2;
+            let is i64 as length with mut = 0;
+            if (lf < 60) {
+                length = lf + 1;
+            } else {
+                let is i64 as nb = lf - 59;
+                if (pos + nb > src_len) { return errno.Z_EOF; }
+                let is i64 as v with mut = 0;
+                let is i64 as i with mut = 0;
+                while (i < nb) {
+                    v = v | (cast(i64, src[pos + i]) << (8 * i));
+                    i = i + 1;
+                }
+                pos = pos + nb;
+                length = v + 1;
+            }
+            if (pos + length > src_len) { return errno.Z_EOF; }
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), length) < 0) { return errno.Z_OOM; }
+            pos = pos + length;
+        } else if (typ == 1) {
+            let is i64 as length = ((tag >> 2) & 7) + 4;
+            if (pos >= src_len) { return errno.Z_EOF; }
+            let is i64 as offset = ((tag >> 5) << 8) | cast(i64, src[pos]);
+            pos = pos + 1;
+            let is i64 as r = _copy_back(out, offset, length);
+            if (r < 0) { return r; }
+        } else if (typ == 2) {
+            let is i64 as length = (tag >> 2) + 1;
+            if (pos + 2 > src_len) { return errno.Z_EOF; }
+            let is i64 as offset = cast(i64, src[pos]) | (cast(i64, src[pos + 1]) << 8);
+            pos = pos + 2;
+            let is i64 as r = _copy_back(out, offset, length);
+            if (r < 0) { return r; }
+        } else {
+            let is i64 as length = (tag >> 2) + 1;
+            if (pos + 4 > src_len) { return errno.Z_EOF; }
+            let is i64 as offset = cast(i64, src[pos]) | (cast(i64, src[pos + 1]) << 8)
+                                 | (cast(i64, src[pos + 2]) << 16) | (cast(i64, src[pos + 3]) << 24);
+            pos = pos + 4;
+            let is i64 as r = _copy_back(out, offset, length);
+            if (r < 0) { return r; }
+        }
+    }
+
+    if (out.len != ulen) { return errno.Z_BADLEN; }
+    return out.len;
+}

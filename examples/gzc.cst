@@ -1,0 +1,41 @@
+// =======================================================
+// examples/gzc.cst — compress a file to a gzip stream on stdout.
+//   gzc <file>  > file.gz
+// Output is a standard gzip stream (decompresses with gunzip/zcat).
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" only bins, core as mem;
+use "../core/bytes.cst" as bytes;
+use "../formats/gzip.cst" as gzip;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() < 2) {
+        io.write_str(io.STDERR, "usage: gzc <file> > file.gz\n");
+        return 2;
+    }
+    let is *u8 as path = env.argv(1);
+
+    let is i64 as sz = io.file_size(path);
+    if (sz < 0) { io.write_str(io.STDERR, "gzc: cannot stat file\n"); return 1; }
+    let is *u8 as buf = mem.core.mmap_anon(sz + 1);
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { io.write_str(io.STDERR, "gzc: cannot open file\n"); return 1; }
+    let is i64 as got with mut = 0;
+    if (sz > 0) { got = io.read_exact(fd, buf, sz); }
+    io._close_fd(fd);
+    if (got != sz) { io.write_str(io.STDERR, "gzc: read error\n"); return 1; }
+
+    let is bytes.Bytes as out = bytes.bytes_new(1024);
+    let is i64 as r = gzip.gzip_compress(buf, sz, &out, 6);
+    if (r < 0) {
+        io.write_str(io.STDERR, "gzc: compress error\n");
+        bytes.bytes_free(&out);
+        return 1;
+    }
+    io.write_bytes(io.STDOUT, out.ptr, out.len);
+    bytes.bytes_free(&out);
+    return 0;
+}

@@ -1,0 +1,4 @@
+.caustic/
+build/
+*.cst.s
+*.cst.s.o

@@ -1,0 +1,43 @@
+// =======================================================
+// examples/zcat.cst — decompress a .gz file to stdout.
+//   zcat <file.gz>
+// Demonstrates the public gzip API over the mmap-backed Bytes buffer.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" only bins, core as mem;
+use "../core/bytes.cst" as bytes;
+use "../formats/gzip.cst" as gzip;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() < 2) {
+        io.write_str(io.STDERR, "usage: zcat <file.gz>\n");
+        return 2;
+    }
+    let is *u8 as path = env.argv(1);
+
+    let is i64 as sz = io.file_size(path);
+    if (sz < 0) { io.write_str(io.STDERR, "zcat: cannot stat file\n"); return 1; }
+    let is *u8 as buf = mem.core.mmap_anon(sz + 1);
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { io.write_str(io.STDERR, "zcat: cannot open file\n"); return 1; }
+    let is i64 as got with mut = 0;
+    if (sz > 0) { got = io.read_exact(fd, buf, sz); }
+    io._close_fd(fd);
+    if (got != sz) { io.write_str(io.STDERR, "zcat: read error\n"); return 1; }
+
+    let is bytes.Bytes as out = bytes.bytes_new(4096);
+    let is i64 as r = gzip.gzip_decompress(buf, sz, &out);
+    if (r < 0) {
+        io.write_str(io.STDERR, "zcat: decompress error (");
+        io.write_int(io.STDERR, r);
+        io.write_str(io.STDERR, ")\n");
+        bytes.bytes_free(&out);
+        return 1;
+    }
+    io.write_bytes(io.STDOUT, out.ptr, out.len);
+    bytes.bytes_free(&out);
+    return 0;
+}

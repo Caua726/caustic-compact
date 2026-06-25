@@ -1,0 +1,53 @@
+// =======================================================
+// caustic-compact/formats/zlib.cst
+// zlib container (RFC 1950): 2-byte header + raw DEFLATE + 4-byte Adler-32.
+// A PNG IDAT stream is exactly a zlib stream, so this also decodes PNG pixel data.
+//   zlib_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "../core/checksum.cst" as checksum;
+use "inflate.cst" as inflate;
+use "deflate.cst" as deflate;
+
+// Big-endian 32-bit read (zlib stores Adler-32 most-significant byte first).
+fn _be32(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 24) | (cast(i64, p[off + 1]) << 16)
+         | (cast(i64, p[off + 2]) << 8) | cast(i64, p[off + 3]);
+}
+
+fn zlib_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (src_len < 6) { return errno.Z_BADHDR; }
+    let is i64 as cmf = cast(i64, src[0]);
+    let is i64 as flg = cast(i64, src[1]);
+    if ((cmf & 0x0F) != 8) { return errno.Z_BADHDR; }              // CM must be deflate
+    if (((cmf * 256 + flg) % 31) != 0) { return errno.Z_BADHDR; }  // header checksum
+    if ((flg & 0x20) != 0) { return errno.Z_BADHDR; }             // FDICT unsupported
+
+    let is *u8 as body = cast(*u8, cast(i64, src) + 2);
+    let is i64 as body_len = src_len - 2 - 4;
+    if (body_len < 0) { return errno.Z_BADHDR; }
+
+    let is i64 as r = inflate.inflate(body, body_len, out);
+    if (r < 0) { return r; }
+
+    let is i64 as stored = _be32(src, src_len - 4);
+    let is i64 as got = checksum.adler32(out.ptr, out.len);
+    if (got != stored) { return errno.Z_BADSUM; }
+    return out.len;
+}
+
+// Compress `src` into a zlib stream appended to `out` (= PNG IDAT encoding).
+fn zlib_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    bytes.bytes_push(out, cast(u8, 0x78));   // CMF: CM=8, CINFO=7 (32 KB window)
+    bytes.bytes_push(out, cast(u8, 0x01));   // FLG: (0x78*256+1)%31==0, FLEVEL=0
+    let is i64 as r = deflate.deflate_compress(src, src_len, out, level);
+    if (r < 0) { return r; }
+    let is i64 as ad = checksum.adler32(src, src_len);
+    bytes.bytes_push(out, cast(u8, (ad >> 24) & 0xFF));   // Adler-32, big-endian
+    bytes.bytes_push(out, cast(u8, (ad >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (ad >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, ad & 0xFF));
+    return out.len;
+}
