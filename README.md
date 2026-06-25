@@ -48,6 +48,12 @@ tests/     run.sh · gen_fixtures.sh · test_*
 
 ## Status
 
+Every format also has an **encoder**: deflate/gzip/zlib (fixed-Huffman),
+lz4/snappy (greedy matcher), lzma/xz (range encoder + greedy matcher), bzip2
+(forward BWT + length-limited Huffman), and zstd/brotli (valid store mode —
+raw blocks / uncompressed meta-blocks). Each encoder's output round-trips
+through the matching decoder and decompresses with the system tool.
+
 | Phase | Module | State |
 |---|---|---|
 | 0 | `core/` errno · bytes · bitreader · huffman · checksum | ✅ green (`tests/test_core`) |

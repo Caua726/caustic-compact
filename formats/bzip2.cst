@@ -289,3 +289,366 @@ fn bzip2_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
     }
     return out.len;
 }
+
+// ===================== bzip2 ENCODER ===================================
+// MSB-first bit writer.
+struct BzWr { out as *bytes.Bytes; acc as i64; nbits as i64; }
+fn _bw_put(w as *BzWr, value as i64, n as i64) as void {
+    w.acc = (w.acc << n) | (value & ((1 << n) - 1));
+    w.nbits = w.nbits + n;
+    while (w.nbits >= 8) {
+        w.nbits = w.nbits - 8;
+        bytes.bytes_push(w.out, cast(u8, (w.acc >> w.nbits) & 0xFF));
+    }
+}
+fn _bw_flush(w as *BzWr) as void {
+    if (w.nbits > 0) {
+        bytes.bytes_push(w.out, cast(u8, (w.acc << (8 - w.nbits)) & 0xFF));
+        w.nbits = 0; w.acc = 0;
+    }
+}
+
+// CRC-32/BZIP2 (non-reflected, poly 0x04C11DB7).
+let is *i64 as _bzcrc with mut;
+let is i32 as _bzcrc_ready with mut = 0;
+fn _bzcrc_init() as void {
+    if (_bzcrc_ready == 1) { return; }
+    _bzcrc = _i64arr(256);
+    let is i64 as n with mut = 0;
+    while (n < 256) {
+        let is i64 as c with mut = (n << 24) & 0xFFFFFFFF;
+        let is i64 as k with mut = 0;
+        while (k < 8) {
+            if ((c & 0x80000000) != 0) { c = ((c << 1) ^ 0x04C11DB7) & 0xFFFFFFFF; }
+            else { c = (c << 1) & 0xFFFFFFFF; }
+            k = k + 1;
+        }
+        _bzcrc[n] = c;
+        n = n + 1;
+    }
+    _bzcrc_ready = 1;
+}
+fn _bzcrc32(buf as *u8, len as i64) as i64 {
+    _bzcrc_init();
+    let is i64 as crc with mut = 0xFFFFFFFF;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        crc = ((crc << 8) ^ _bzcrc[((crc >> 24) ^ cast(i64, buf[i])) & 0xFF]) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+// Length-limited Huffman code lengths (BZ2_hbMakeCodeLengths), maxLen 17.
+fn _mk_lengths(len as *i64, freq as *i64, alphaSize as i64) as void {
+    let is *i64 as heap = _i64arr(516);
+    let is *i64 as weight = _i64arr(520);
+    let is *i64 as parent = _i64arr(520);
+    let is i64 as i with mut = 0;
+    while (i < alphaSize) {
+        let is i64 as f with mut = freq[i];
+        if (f == 0) { f = 1; }
+        weight[i + 1] = f << 8;
+        i = i + 1;
+    }
+    while (1 == 1) {
+        let is i64 as nNodes with mut = alphaSize;
+        let is i64 as nHeap with mut = 0;
+        heap[0] = 0; weight[0] = 0; parent[0] = 0 - 2;
+        i = 1;
+        while (i <= alphaSize) {
+            parent[i] = 0 - 1; nHeap = nHeap + 1; heap[nHeap] = i;
+            let is i64 as zz with mut = nHeap;
+            let is i64 as tmp = heap[zz];
+            while (weight[tmp] < weight[heap[zz >> 1]]) { heap[zz] = heap[zz >> 1]; zz = zz >> 1; }
+            heap[zz] = tmp;
+            i = i + 1;
+        }
+        while (nHeap > 1) {
+            let is i64 as n1 = heap[1]; heap[1] = heap[nHeap]; nHeap = nHeap - 1;
+            let is i64 as zz1 with mut = 1;
+            let is i64 as tmp1 = heap[zz1];
+            while (1 == 1) {
+                let is i64 as yy with mut = zz1 << 1;
+                if (yy > nHeap) { break; }
+                if (yy < nHeap) { if (weight[heap[yy + 1]] < weight[heap[yy]]) { yy = yy + 1; } }
+                if (weight[tmp1] < weight[heap[yy]]) { break; }
+                heap[zz1] = heap[yy]; zz1 = yy;
+            }
+            heap[zz1] = tmp1;
+            let is i64 as n2 = heap[1]; heap[1] = heap[nHeap]; nHeap = nHeap - 1;
+            let is i64 as zz2 with mut = 1;
+            let is i64 as tmp2 = heap[zz2];
+            while (1 == 1) {
+                let is i64 as yy with mut = zz2 << 1;
+                if (yy > nHeap) { break; }
+                if (yy < nHeap) { if (weight[heap[yy + 1]] < weight[heap[yy]]) { yy = yy + 1; } }
+                if (weight[tmp2] < weight[heap[yy]]) { break; }
+                heap[zz2] = heap[yy]; zz2 = yy;
+            }
+            heap[zz2] = tmp2;
+            nNodes = nNodes + 1;
+            parent[n1] = nNodes; parent[n2] = nNodes;
+            let is i64 as w1 = weight[n1];
+            let is i64 as w2 = weight[n2];
+            let is i64 as lo1 = w1 & 0xFF;
+            let is i64 as lo2 = w2 & 0xFF;
+            let is i64 as mx with mut = lo1;
+            if (lo2 > mx) { mx = lo2; }
+            weight[nNodes] = ((w1 & 0xFFFFFF00) + (w2 & 0xFFFFFF00)) | (1 + mx);
+            parent[nNodes] = 0 - 1; nHeap = nHeap + 1; heap[nHeap] = nNodes;
+            let is i64 as zz3 with mut = nHeap;
+            let is i64 as tmp3 = heap[zz3];
+            while (weight[tmp3] < weight[heap[zz3 >> 1]]) { heap[zz3] = heap[zz3 >> 1]; zz3 = zz3 >> 1; }
+            heap[zz3] = tmp3;
+        }
+        let is i64 as tooLong with mut = 0;
+        i = 1;
+        while (i <= alphaSize) {
+            let is i64 as j with mut = 0;
+            let is i64 as k with mut = i;
+            while (parent[k] >= 0) { k = parent[k]; j = j + 1; }
+            len[i - 1] = j;
+            if (j > 17) { tooLong = 1; }
+            i = i + 1;
+        }
+        if (tooLong == 0) { break; }
+        i = 1;
+        while (i <= alphaSize) {
+            let is i64 as j with mut = weight[i] >> 8;
+            j = 1 + (j / 2);
+            weight[i] = j << 8;
+            i = i + 1;
+        }
+    }
+    mem.core.munmap(cast(*u8, heap), 516 * 8);
+    mem.core.munmap(cast(*u8, weight), 520 * 8);
+    mem.core.munmap(cast(*u8, parent), 520 * 8);
+}
+
+// stable counting sort of sa[] (length n) by key[sa[i]] in [0, mk]; into dst.
+fn _csort(sa as *i64, dst as *i64, key as *i64, n as i64, cnt as *i64, mk as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i <= mk + 1) { cnt[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < n) { cnt[key[sa[i]] + 1] = cnt[key[sa[i]] + 1] + 1; i = i + 1; }
+    i = 1;
+    while (i <= mk) { cnt[i] = cnt[i] + cnt[i - 1]; i = i + 1; }
+    i = 0;
+    while (i < n) {
+        let is i64 as k = key[sa[i]];
+        dst[cnt[k]] = sa[i];
+        cnt[k] = cnt[k] + 1;
+        i = i + 1;
+    }
+}
+
+fn bzip2_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    bytes.bytes_push(out, cast(u8, 0x42)); bytes.bytes_push(out, cast(u8, 0x5A));
+    bytes.bytes_push(out, cast(u8, 0x68)); bytes.bytes_push(out, cast(u8, 0x39));   // "BZh9"
+
+    let is BzWr as w;
+    w.out = out; w.acc = 0; w.nbits = 0;
+
+    if (src_len > 0) {
+        // --- RLE1 ---
+        let is *u8 as rle = mem.core.mmap_anon(src_len * 2 + 16);
+        let is i64 as rn with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < src_len) {
+            let is i64 as b = cast(i64, src[i]);
+            let is i64 as run with mut = 1;
+            i = i + 1;
+            while (i < src_len) { if (cast(i64, src[i]) != b) { break; } run = run + 1; i = i + 1; }
+            while (run >= 4) {
+                let is i64 as c with mut = run - 4;
+                if (c > 251) { c = 251; }
+                rle[rn] = cast(u8, b); rle[rn + 1] = cast(u8, b); rle[rn + 2] = cast(u8, b); rle[rn + 3] = cast(u8, b);
+                rle[rn + 4] = cast(u8, c); rn = rn + 5;
+                run = run - (4 + c);
+            }
+            while (run > 0) { rle[rn] = cast(u8, b); rn = rn + 1; run = run - 1; }
+        }
+
+        // --- forward BWT (prefix-doubling rotation sort) ---
+        let is i64 as n = rn;
+        let is *i64 as sa = _i64arr(n + 1);
+        let is *i64 as sa2 = _i64arr(n + 1);
+        let is *i64 as rank = _i64arr(n + 1);
+        let is *i64 as nrank = _i64arr(n + 1);
+        let is *i64 as key = _i64arr(n + 1);
+        let is *i64 as cnt = _i64arr(n + 260);
+        let is i64 as maxRank with mut = 255;
+        i = 0;
+        while (i < n) { sa[i] = i; rank[i] = cast(i64, rle[i]); i = i + 1; }
+        let is i64 as kk with mut = 1;
+        while (kk < n) {
+            // sort by second key rank[(i+kk)%n]
+            i = 0;
+            while (i < n) { let is i64 as idx with mut = i + kk; if (idx >= n) { idx = idx - n; } key[i] = rank[idx]; i = i + 1; }
+            _csort(sa, sa2, key, n, cnt, maxRank);
+            // then by first key rank[i]
+            _csort(sa2, sa, rank, n, cnt, maxRank);
+            // recompute ranks
+            nrank[sa[0]] = 0;
+            let is i64 as r with mut = 0;
+            i = 1;
+            while (i < n) {
+                let is i64 as a = sa[i - 1];
+                let is i64 as bb = sa[i];
+                let is i64 as a2 with mut = a + kk; if (a2 >= n) { a2 = a2 - n; }
+                let is i64 as b2 with mut = bb + kk; if (b2 >= n) { b2 = b2 - n; }
+                if (rank[a] != rank[bb]) { r = r + 1; }
+                else { if (rank[a2] != rank[b2]) { r = r + 1; } }
+                nrank[bb] = r;
+                i = i + 1;
+            }
+            i = 0;
+            while (i < n) { rank[i] = nrank[i]; i = i + 1; }
+            maxRank = r;
+            if (r == n - 1) { break; }
+            kk = kk * 2;
+        }
+        // BWT last column + origPtr
+        let is *u8 as bwt = mem.core.mmap_anon(n + 8);
+        let is i64 as origPtr with mut = 0;
+        i = 0;
+        while (i < n) {
+            let is i64 as p = sa[i];
+            if (p == 0) { origPtr = i; bwt[i] = rle[n - 1]; }
+            else { bwt[i] = rle[p - 1]; }
+            i = i + 1;
+        }
+
+        // --- MTF + RLE2 ---
+        let is [256]i64 as inUse;
+        i = 0; while (i < 256) { inUse[i] = 0; i = i + 1; }
+        i = 0; while (i < n) { inUse[cast(i64, bwt[i])] = 1; i = i + 1; }
+        let is [256]i64 as symMap;
+        let is i64 as nInUse with mut = 0;
+        i = 0;
+        while (i < 256) { if (inUse[i] == 1) { symMap[nInUse] = i; nInUse = nInUse + 1; } i = i + 1; }
+        let is i64 as EOB = nInUse + 1;
+        let is i64 as alphaSize = nInUse + 2;
+
+        let is [256]i64 as mtf;
+        i = 0; while (i < nInUse) { mtf[i] = symMap[i]; i = i + 1; }
+        let is *i64 as syms = _i64arr(n + 16);
+        let is i64 as ns with mut = 0;
+        let is *i64 as freq = _i64arr(alphaSize + 2);
+        i = 0; while (i < alphaSize) { freq[i] = 0; i = i + 1; }
+        let is i64 as zr with mut = 0;
+        i = 0;
+        while (i < n) {
+            let is i64 as bb = cast(i64, bwt[i]);
+            let is i64 as j with mut = 0;
+            while (mtf[j] != bb) { j = j + 1; }
+            if (j == 0) {
+                zr = zr + 1;
+            } else {
+                while (zr > 0) {
+                    zr = zr - 1;
+                    let is i64 as sym = zr & 1;       // RUNA=0 / RUNB=1
+                    syms[ns] = sym; freq[sym] = freq[sym] + 1; ns = ns + 1;
+                    zr = zr >> 1;
+                }
+                let is i64 as v = mtf[j];
+                let is i64 as kk2 with mut = j;
+                while (kk2 > 0) { mtf[kk2] = mtf[kk2 - 1]; kk2 = kk2 - 1; }
+                mtf[0] = v;
+                syms[ns] = j + 1; freq[j + 1] = freq[j + 1] + 1; ns = ns + 1;
+            }
+            i = i + 1;
+        }
+        while (zr > 0) {
+            zr = zr - 1;
+            let is i64 as sym = zr & 1;
+            syms[ns] = sym; freq[sym] = freq[sym] + 1; ns = ns + 1;
+            zr = zr >> 1;
+        }
+        syms[ns] = EOB; freq[EOB] = freq[EOB] + 1; ns = ns + 1;
+
+        // --- Huffman code lengths (2 identical groups) ---
+        let is *i64 as len = _i64arr(alphaSize + 2);
+        _mk_lengths(len, freq, alphaSize);
+        let is i64 as minLen with mut = 32;
+        let is i64 as maxLen with mut = 0;
+        i = 0;
+        while (i < alphaSize) { if (len[i] > maxLen) { maxLen = len[i]; } if (len[i] < minLen) { minLen = len[i]; } i = i + 1; }
+        let is *i64 as code = _i64arr(alphaSize + 2);
+        let is i64 as vec with mut = 0;
+        let is i64 as L with mut = minLen;
+        while (L <= maxLen) {
+            i = 0;
+            while (i < alphaSize) { if (len[i] == L) { code[i] = vec; vec = vec + 1; } i = i + 1; }
+            vec = vec << 1;
+            L = L + 1;
+        }
+
+        // --- block header ---
+        let is i64 as crc = _bzcrc32(src, src_len);
+        _bw_put(&w, 0x314159, 24); _bw_put(&w, 0x265359, 24);   // block magic
+        _bw_put(&w, (crc >> 16) & 0xFFFF, 16); _bw_put(&w, crc & 0xFFFF, 16);
+        _bw_put(&w, 0, 1);                                       // not randomized
+        _bw_put(&w, origPtr, 24);
+
+        // symbol map (16-bit group mask + per-group 16-bit)
+        let is i64 as used16 with mut = 0;
+        let is i64 as g with mut = 0;
+        while (g < 16) {
+            let is i64 as any with mut = 0;
+            let is i64 as s with mut = 0;
+            while (s < 16) { if (inUse[g * 16 + s] == 1) { any = 1; } s = s + 1; }
+            if (any == 1) { used16 = used16 | (1 << (15 - g)); }
+            g = g + 1;
+        }
+        _bw_put(&w, used16, 16);
+        g = 0;
+        while (g < 16) {
+            if (((used16 >> (15 - g)) & 1) == 1) {
+                let is i64 as bits with mut = 0;
+                let is i64 as s with mut = 0;
+                while (s < 16) { if (inUse[g * 16 + s] == 1) { bits = bits | (1 << (15 - s)); } s = s + 1; }
+                _bw_put(&w, bits, 16);
+            }
+            g = g + 1;
+        }
+
+        // 2 groups, all selectors = 0
+        _bw_put(&w, 2, 3);
+        let is i64 as nSel = (ns + 49) / 50;
+        _bw_put(&w, nSel, 15);
+        let is i64 as si with mut = 0;
+        while (si < nSel) { _bw_put(&w, 0, 1); si = si + 1; }   // selector MTF index 0 -> "0"
+
+        // 2 identical Huffman tables (delta-encoded lengths)
+        let is i64 as gi with mut = 0;
+        while (gi < 2) {
+            let is i64 as curr with mut = len[0];
+            _bw_put(&w, curr, 5);
+            i = 0;
+            while (i < alphaSize) {
+                while (curr != len[i]) {
+                    _bw_put(&w, 1, 1);
+                    if (curr < len[i]) { _bw_put(&w, 0, 1); curr = curr + 1; }
+                    else { _bw_put(&w, 1, 1); curr = curr - 1; }
+                }
+                _bw_put(&w, 0, 1);
+                i = i + 1;
+            }
+            gi = gi + 1;
+        }
+
+        // data: encode all MTF/RLE2 symbols with group 0
+        i = 0;
+        while (i < ns) { _bw_put(&w, code[syms[i]], len[syms[i]]); i = i + 1; }
+    }
+
+    // --- stream footer ---
+    let is i64 as combined with mut = 0;
+    if (src_len > 0) { combined = _bzcrc32(src, src_len); }
+    _bw_put(&w, 0x177245, 24); _bw_put(&w, 0x385090, 24);   // eos magic
+    _bw_put(&w, (combined >> 16) & 0xFFFF, 16); _bw_put(&w, combined & 0xFFFF, 16);
+    _bw_flush(&w);
+    return out.len;
+}
