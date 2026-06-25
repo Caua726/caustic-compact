@@ -9,6 +9,8 @@
 
 use "../core/errno.cst" as errno;
 use "../core/bytes.cst" as bytes;
+use "../core/checksum.cst" as checksum;
+use "lzma.cst" as lzma;
 use "lzma2.cst" as lzma2;
 
 // xz multibyte integer (LEB128, little-endian, high bit = continue).
@@ -72,5 +74,125 @@ fn xz_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         after = after + checkSize;                               // skip the block check
         pos = after;
     }
+    return out.len;
+}
+
+// ---- encode -----------------------------------------------------------
+fn _wvar(out as *bytes.Bytes, n as i64) as void {
+    let is i64 as v with mut = n;
+    while (v >= 0x80) { bytes.bytes_push(out, cast(u8, (v & 0x7F) | 0x80)); v = v >> 7; }
+    bytes.bytes_push(out, cast(u8, v));
+}
+fn _crc_range(b as *bytes.Bytes, off as i64, len as i64) as i64 {
+    return checksum.crc32(cast(*u8, cast(i64, b.ptr) + off), len);
+}
+fn _push_le32(out as *bytes.Bytes, v as i64) as void {
+    bytes.bytes_push(out, cast(u8, v & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 24) & 0xFF));
+}
+
+// Build an LZMA2 stream (compressed chunks, uncompressed fallback) into out.
+fn _lzma2_encode(src as *u8, slen as i64, out as *bytes.Bytes) as i64 {
+    let is i64 as pos with mut = 0;
+    while (pos < slen) {
+        let is i64 as block with mut = slen - pos;
+        if (block > 1048576) { block = 1048576; }   // 1 MB (< 2 MB LZMA2 limit)
+        let is bytes.Bytes as comp = bytes.bytes_new(256);
+        let is lzma.Lzma as lz;
+        if (lzma.lzma_init(&lz, 93) < 0) { bytes.bytes_free(&comp); return errno.Z_OOM; }
+        lzma.lzma_reset_probs(&lz);
+        lz.dictStart = 0;
+        lzma._lzma_encode(&lz, cast(*u8, cast(i64, src) + pos), block, &comp);
+        if (comp.len <= 65536 && comp.len < block) {
+            let is i64 as usz = block - 1;
+            let is i64 as csz = comp.len - 1;
+            bytes.bytes_push(out, cast(u8, 0xE0 | ((usz >> 16) & 0x1F)));   // reset=3, compressed
+            bytes.bytes_push(out, cast(u8, (usz >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, usz & 0xFF));
+            bytes.bytes_push(out, cast(u8, (csz >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, csz & 0xFF));
+            bytes.bytes_push(out, cast(u8, 93));                            // props lc3 lp0 pb2
+            bytes.bytes_append(out, comp.ptr, comp.len);
+        } else {
+            let is i64 as p2 with mut = pos;
+            let is i64 as rem with mut = block;
+            let is i64 as firstU with mut = 1;
+            while (rem > 0) {
+                let is i64 as u with mut = rem;
+                if (u > 65536) { u = 65536; }
+                if (firstU == 1) { bytes.bytes_push(out, cast(u8, 1)); } else { bytes.bytes_push(out, cast(u8, 2)); }
+                firstU = 0;
+                bytes.bytes_push(out, cast(u8, ((u - 1) >> 8) & 0xFF));
+                bytes.bytes_push(out, cast(u8, (u - 1) & 0xFF));
+                bytes.bytes_append(out, cast(*u8, cast(i64, src) + p2), u);
+                p2 = p2 + u; rem = rem - u;
+            }
+        }
+        bytes.bytes_free(&comp);
+        pos = pos + block;
+    }
+    bytes.bytes_push(out, cast(u8, 0));   // LZMA2 end marker
+    return 0;
+}
+
+fn xz_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    // --- stream header ---
+    bytes.bytes_push(out, cast(u8, 0xFD)); bytes.bytes_push(out, cast(u8, 0x37));
+    bytes.bytes_push(out, cast(u8, 0x7A)); bytes.bytes_push(out, cast(u8, 0x58));
+    bytes.bytes_push(out, cast(u8, 0x5A)); bytes.bytes_push(out, cast(u8, 0x00));
+    let is i64 as flagsOff = out.len;
+    bytes.bytes_push(out, cast(u8, 0x00)); bytes.bytes_push(out, cast(u8, 0x00));   // stream flags (check=none)
+    _push_le32(out, _crc_range(out, flagsOff, 2));
+
+    // --- block header (12 bytes: size, flags, LZMA2 filter, padding, CRC32) ---
+    let is i64 as bhOff = out.len;
+    bytes.bytes_push(out, cast(u8, 0x02));   // header size = (2+1)*4 = 12
+    bytes.bytes_push(out, cast(u8, 0x00));   // block flags: 1 filter, no sizes
+    bytes.bytes_push(out, cast(u8, 0x21));   // filter id: LZMA2
+    bytes.bytes_push(out, cast(u8, 0x01));   // props size
+    bytes.bytes_push(out, cast(u8, 0x14));   // dict size byte (20 -> 4 MB)
+    bytes.bytes_push(out, cast(u8, 0x00)); bytes.bytes_push(out, cast(u8, 0x00)); bytes.bytes_push(out, cast(u8, 0x00));  // padding
+    _push_le32(out, _crc_range(out, bhOff, 8));
+
+    // --- LZMA2 compressed data ---
+    let is i64 as dataOff = out.len;
+    if (_lzma2_encode(src, src_len, out) < 0) { return errno.Z_OOM; }
+    let is i64 as lzma2Len = out.len - dataOff;
+    let is i64 as unpadded = 12 + lzma2Len;   // block header + data (+ check none)
+
+    // block padding to 4-byte boundary
+    let is i64 as totalBlock = 12 + lzma2Len;
+    let is i64 as bpad = (4 - (totalBlock & 3)) & 3;
+    let is i64 as bi with mut = 0;
+    while (bi < bpad) { bytes.bytes_push(out, cast(u8, 0)); bi = bi + 1; }
+
+    // --- index ---
+    let is bytes.Bytes as idx = bytes.bytes_new(64);
+    bytes.bytes_push(&idx, cast(u8, 0x00));   // index indicator
+    _wvar(&idx, 1);                            // number of records
+    _wvar(&idx, unpadded);
+    _wvar(&idx, src_len);
+    let is i64 as ipad = (4 - (idx.len & 3)) & 3;
+    let is i64 as ii with mut = 0;
+    while (ii < ipad) { bytes.bytes_push(&idx, cast(u8, 0)); ii = ii + 1; }
+    let is i64 as idxCrc = checksum.crc32(idx.ptr, idx.len);
+    _push_le32(&idx, idxCrc);
+    let is i64 as indexSize = idx.len;
+    bytes.bytes_append(out, idx.ptr, idx.len);
+    bytes.bytes_free(&idx);
+
+    // --- stream footer (12 bytes) ---
+    let is i64 as backward = (indexSize / 4) - 1;
+    let is bytes.Bytes as foot = bytes.bytes_new(16);
+    _push_le32(&foot, backward);
+    bytes.bytes_push(&foot, cast(u8, 0x00)); bytes.bytes_push(&foot, cast(u8, 0x00));   // stream flags
+    let is i64 as footCrc = checksum.crc32(foot.ptr, foot.len);
+    _push_le32(out, footCrc);
+    _push_le32(out, backward);
+    bytes.bytes_push(out, cast(u8, 0x00)); bytes.bytes_push(out, cast(u8, 0x00));
+    bytes.bytes_push(out, cast(u8, 0x59)); bytes.bytes_push(out, cast(u8, 0x5A));   // "YZ"
+    bytes.bytes_free(&foot);
     return out.len;
 }

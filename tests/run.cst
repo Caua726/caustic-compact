@@ -275,6 +275,7 @@ fn _encode(kind as i64, src as *u8, slen as i64, out as *bytes.Bytes) as i64 {
     if (kind == 3) { return lz4.lz4_compress(src, slen, out, 1); }
     if (kind == 4) { return snappy.snappy_compress(src, slen, out, 1); }
     if (kind == 5) { return lzma.lzma_alone_compress(src, slen, out, 1); }
+    if (kind == 6) { return xz.xz_compress(src, slen, out, 1); }
     if (kind == 8) { return zstd.zstd_compress(src, slen, out, 1); }
     if (kind == 9) { return brotli.brotli_compress(src, slen, out, 1); }
     return 0 - 1;
@@ -318,6 +319,10 @@ fn suite_encode_modern() as i64 {
     b = b + enc_rt(5, "lzma:lorem",  "tests/fixtures/lorem.bin");
     b = b + enc_rt(5, "lzma:window", "tests/fixtures/window.bin");
     b = b + enc_rt(5, "lzma:big",    "tests/fixtures/big.bin");
+    b = b + enc_rt(6, "xz:hello",  "tests/fixtures/hello.bin");
+    b = b + enc_rt(6, "xz:lorem",  "tests/fixtures/lorem.bin");
+    b = b + enc_rt(6, "xz:window", "tests/fixtures/window.bin");
+    b = b + enc_rt(6, "xz:big",    "tests/fixtures/big.bin");
     b = b + enc_rt(8, "zstd:hello",  "tests/fixtures/hello.bin");
     b = b + enc_rt(8, "zstd:lorem",  "tests/fixtures/lorem.bin");
     b = b + enc_rt(8, "zstd:window", "tests/fixtures/window.bin");
