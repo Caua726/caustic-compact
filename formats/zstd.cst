@@ -609,3 +609,33 @@ fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
     }
     return out.len;
 }
+
+// ---- encode (raw blocks: valid, no compression) -----------------------
+fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    bytes.bytes_push(out, cast(u8, 0x28));
+    bytes.bytes_push(out, cast(u8, 0xB5));
+    bytes.bytes_push(out, cast(u8, 0x2F));
+    bytes.bytes_push(out, cast(u8, 0xFD));
+    bytes.bytes_push(out, cast(u8, 0xA0));   // descriptor: single-segment, 4-byte FCS
+    bytes.bytes_push(out, cast(u8, src_len & 0xFF));
+    bytes.bytes_push(out, cast(u8, (src_len >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (src_len >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (src_len >> 24) & 0xFF));
+
+    let is i64 as pos with mut = 0;
+    let is i64 as first with mut = 1;
+    while (pos < src_len || first == 1) {
+        first = 0;
+        let is i64 as chunk with mut = src_len - pos;
+        if (chunk > 131072) { chunk = 131072; }
+        let is i64 as last with mut = 0;
+        if (pos + chunk >= src_len) { last = 1; }
+        let is i64 as bh = last | (chunk << 3);   // raw block (type 0)
+        bytes.bytes_push(out, cast(u8, bh & 0xFF));
+        bytes.bytes_push(out, cast(u8, (bh >> 8) & 0xFF));
+        bytes.bytes_push(out, cast(u8, (bh >> 16) & 0xFF));
+        if (chunk > 0) { bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), chunk); }
+        pos = pos + chunk;
+    }
+    return out.len;
+}

@@ -16,6 +16,7 @@ use "../core/bytes.cst" as bytes;
 use "std/mem.cst" only bins, core as mem;
 use "brotli_dict.cst" as bd;
 use "brotli_transforms.cst" as bt;
+use "../core/bitwriter.cst" as biw;
 
 // ---------------------------------------------------------------- bit reader
 let is *u8 as _src with mut;
@@ -912,5 +913,33 @@ fn brotli_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
             }
         }
     }
+    return out.len;
+}
+
+// ---- encode (uncompressed meta-blocks: valid, no compression) ---------
+fn brotli_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    let is biw.BitWriter as w;
+    biw.bw_init(&w, out);
+    biw.bw_bits(&w, 0, 1);                  // WBITS = 16
+
+    let is i64 as pos with mut = 0;
+    while (pos < src_len) {
+        let is i64 as chunk with mut = src_len - pos;
+        if (chunk > 16777216) { chunk = 16777216; }   // 2^24
+        biw.bw_bits(&w, 0, 1);              // ISLAST = 0
+        let is i64 as mlen = chunk - 1;
+        let is i64 as nibbles with mut = 4;
+        while ((mlen >> (nibbles * 4)) != 0) { nibbles = nibbles + 1; }
+        biw.bw_bits(&w, nibbles - 4, 2);    // MNIBBLES
+        let is i64 as k with mut = 0;
+        while (k < nibbles) { biw.bw_bits(&w, (mlen >> (4 * k)) & 0xF, 4); k = k + 1; }
+        biw.bw_bits(&w, 1, 1);              // ISUNCOMPRESSED = 1
+        biw.bw_align(&w);
+        bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), chunk);
+        pos = pos + chunk;
+    }
+    biw.bw_bits(&w, 1, 1);                  // ISLAST = 1
+    biw.bw_bits(&w, 1, 1);                  // ISLASTEMPTY = 1
+    biw.bw_align(&w);
     return out.len;
 }
