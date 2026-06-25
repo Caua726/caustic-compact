@@ -1,0 +1,916 @@
+// =======================================================
+// caustic-compact/formats/brotli.cst
+// Brotli decompression (RFC 7932). Port of the reference Java decoder
+// (org.brotli.dec), simplified for one-shot decode: output accumulates in
+// a growable Bytes buffer that doubles as the unbounded sliding window, so
+// the ring-buffer / streaming machinery collapses away.
+// Two-level Huffman tables, block-type switching (literal/command/distance),
+// context maps with inverse-MTF, the insert-and-copy command alphabet, the
+// distance ring + postfix/direct coding, and the static dictionary with
+// its 121 word transforms.
+//   brotli_decompress(src, src_len, out) -> bytes written, or -err.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "std/mem.cst" only bins, core as mem;
+use "brotli_dict.cst" as bd;
+use "brotli_transforms.cst" as bt;
+
+// ---------------------------------------------------------------- bit reader
+let is *u8 as _src with mut;
+let is i64 as _slen with mut;
+let is i64 as _bitp with mut;
+
+fn _peek(n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as shift with mut = 0;
+    let is i64 as left with mut = n;
+    let is i64 as bp with mut = _bitp;
+    while (left > 0) {
+        let is i64 as byteIdx = bp >> 3;
+        let is i64 as bitOff = bp & 7;
+        let is i64 as byte with mut = 0;
+        if (byteIdx < _slen) { byte = cast(i64, _src[byteIdx]); }
+        let is i64 as take with mut = 8 - bitOff;
+        if (take > left) { take = left; }
+        v = v | (((byte >> bitOff) & ((1 << take) - 1)) << shift);
+        shift = shift + take;
+        bp = bp + take;
+        left = left - take;
+    }
+    return v;
+}
+
+fn _take(n as i64) as i64 {
+    let is i64 as v = _peek(n);
+    _bitp = _bitp + n;
+    return v;
+}
+
+fn _balign() as void {
+    _bitp = ((_bitp + 7) >> 3) << 3;
+}
+
+// ---------------------------------------------------------------- constants
+let is *i64 as CMD with mut;       // 704*4 flat command lookup
+let is *i64 as BLOFF with mut;     // block length offsets [26]
+let is *i64 as BLNB with mut;      // block length nbits [26]
+let is *i64 as INSNB with mut;     // insert length nbits [24]
+let is *i64 as CPYNB with mut;     // copy length nbits [24]
+let is *i64 as DSCIO with mut;     // distance short code index offset [16]
+let is *i64 as DSCVO with mut;     // distance short code value offset [16]
+let is *i64 as FIXED with mut;     // code-length-code fixed table [16]
+let is *i64 as CLCO with mut;      // code length code order [18]
+let is *i64 as DSB with mut;       // dictionary size bits [32]
+let is *i64 as DOFF with mut;      // dictionary offsets [32]
+let is *i64 as MHTS with mut;      // max huffman table size [23]
+let is *i64 as CTX with mut;       // context lookup [2048]
+let is i32 as _tab_ready with mut = 0;
+
+let is *u8 as _UM with imut = "\x20\x20\x20\x20\x20\x20\x20\x20\x20\x21\x21\x20\x20\x21\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x22\x23\x24\x23\x23\x25\x23\x24\x26\x27\x23\x23\x28\x23\x29\x23\x2b\x2b\x2b\x2b\x2b\x2b\x2b\x2b\x2b\x2b\x28\x28\x26\x2a\x27\x23\x23\x2c\x2d\x2d\x2d\x2c\x2d\x2d\x2d\x2c\x2d\x2d\x2d\x2d\x2d\x2c\x2d\x2d\x2d\x2d\x2d\x2c\x2d\x2d\x2d\x2d\x2d\x26\x23\x27\x23\x23\x23\x2e\x2f\x2f\x2f\x2e\x2f\x2f\x2f\x2e\x2f\x2f\x2f\x2f\x2f\x2e\x2f\x2f\x2f\x2f\x2f\x2e\x2f\x2f\x2f\x2f\x2f\x26\x23\x27\x23\x20";
+let is *u8 as _UR with imut = "\x41\x2f\x2a\x20\x20\x27\x3a\x20\x20\x26\x20\x3a\x20\x24\x20\x20\x81\x20\x40";
+
+fn _ia(n as i64) as *i64 { return cast(*i64, mem.core.mmap_anon(n * 8)); }
+
+fn _ctx_init() as void {
+    let is i64 as i with mut = 0;
+    while (i < 256) {
+        CTX[i] = i & 0x3F;
+        CTX[512 + i] = i >> 2;
+        CTX[1792 + i] = 2 + (i >> 6);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 128) { CTX[1024 + i] = 4 * (cast(i64, _UM[i]) - 32); i = i + 1; }
+    i = 0;
+    while (i < 64) { CTX[1152 + i] = i & 1; CTX[1216 + i] = 2 + (i & 1); i = i + 1; }
+    let is i64 as off with mut = 1280;
+    let is i64 as k with mut = 0;
+    while (k < 19) {
+        let is i64 as value = k & 3;
+        let is i64 as rep = cast(i64, _UR[k]) - 32;
+        let is i64 as j with mut = 0;
+        while (j < rep) { CTX[off] = value; off = off + 1; j = j + 1; }
+        k = k + 1;
+    }
+    i = 0;
+    while (i < 16) { CTX[1792 + i] = 1; CTX[2032 + i] = 6; i = i + 1; }
+    CTX[1792] = 0;
+    CTX[2047] = 7;
+    i = 0;
+    while (i < 256) { CTX[1536 + i] = CTX[1792 + i] << 3; i = i + 1; }
+}
+
+fn _cmd_init() as void {
+    let is [24]i64 as insOff;
+    let is [24]i64 as cpyOff;
+    cpyOff[0] = 2;
+    insOff[0] = 0;
+    let is i64 as i with mut = 0;
+    while (i < 23) {
+        insOff[i + 1] = insOff[i] + (1 << INSNB[i]);
+        cpyOff[i + 1] = cpyOff[i] + (1 << CPYNB[i]);
+        i = i + 1;
+    }
+    let is i64 as cmdCode with mut = 0;
+    while (cmdCode < 704) {
+        let is i64 as rangeIdx with mut = cmdCode >> 6;
+        let is i64 as distCtxOff with mut = 0 - 4;
+        if (rangeIdx >= 2) { rangeIdx = rangeIdx - 2; distCtxOff = 0; }
+        let is i64 as insertCode = (((0x29850 >> (rangeIdx * 2)) & 0x3) << 3) | ((cmdCode >> 3) & 7);
+        let is i64 as copyCode = (((0x26244 >> (rangeIdx * 2)) & 0x3) << 3) | (cmdCode & 7);
+        let is i64 as cpoff = cpyOff[copyCode];
+        let is i64 as m with mut = cpoff;
+        if (m > 5) { m = 5; }
+        let is i64 as distContext = distCtxOff + m - 2;
+        let is i64 as idx = cmdCode * 4;
+        CMD[idx] = INSNB[insertCode] | (CPYNB[copyCode] << 8);
+        CMD[idx + 1] = insOff[insertCode];
+        CMD[idx + 2] = cpoff;
+        CMD[idx + 3] = distContext;
+        cmdCode = cmdCode + 1;
+    }
+}
+
+fn _tabs() as void {
+    if (_tab_ready == 1) { return; }
+    bt._trans_init();
+    CMD = _ia(704 * 4);
+    BLOFF = _ia(26); BLNB = _ia(26); INSNB = _ia(24); CPYNB = _ia(24);
+    DSCIO = _ia(16); DSCVO = _ia(16); FIXED = _ia(16); CLCO = _ia(18);
+    DSB = _ia(32); DOFF = _ia(32); MHTS = _ia(23); CTX = _ia(2048);
+
+    BLOFF[0]=1; BLOFF[1]=5; BLOFF[2]=9; BLOFF[3]=13; BLOFF[4]=17; BLOFF[5]=25;
+    BLOFF[6]=33; BLOFF[7]=41; BLOFF[8]=49; BLOFF[9]=65; BLOFF[10]=81; BLOFF[11]=97;
+    BLOFF[12]=113; BLOFF[13]=145; BLOFF[14]=177; BLOFF[15]=209; BLOFF[16]=241;
+    BLOFF[17]=305; BLOFF[18]=369; BLOFF[19]=497; BLOFF[20]=753; BLOFF[21]=1265;
+    BLOFF[22]=2289; BLOFF[23]=4337; BLOFF[24]=8433; BLOFF[25]=16625;
+    BLNB[0]=2; BLNB[1]=2; BLNB[2]=2; BLNB[3]=2; BLNB[4]=3; BLNB[5]=3; BLNB[6]=3;
+    BLNB[7]=3; BLNB[8]=4; BLNB[9]=4; BLNB[10]=4; BLNB[11]=4; BLNB[12]=5; BLNB[13]=5;
+    BLNB[14]=5; BLNB[15]=5; BLNB[16]=6; BLNB[17]=6; BLNB[18]=7; BLNB[19]=8; BLNB[20]=9;
+    BLNB[21]=10; BLNB[22]=11; BLNB[23]=12; BLNB[24]=13; BLNB[25]=24;
+
+    INSNB[0]=0; INSNB[1]=0; INSNB[2]=0; INSNB[3]=0; INSNB[4]=0; INSNB[5]=0;
+    INSNB[6]=1; INSNB[7]=1; INSNB[8]=2; INSNB[9]=2; INSNB[10]=3; INSNB[11]=3;
+    INSNB[12]=4; INSNB[13]=4; INSNB[14]=5; INSNB[15]=5; INSNB[16]=6; INSNB[17]=7;
+    INSNB[18]=8; INSNB[19]=9; INSNB[20]=10; INSNB[21]=12; INSNB[22]=14; INSNB[23]=24;
+    CPYNB[0]=0; CPYNB[1]=0; CPYNB[2]=0; CPYNB[3]=0; CPYNB[4]=0; CPYNB[5]=0;
+    CPYNB[6]=0; CPYNB[7]=0; CPYNB[8]=1; CPYNB[9]=1; CPYNB[10]=2; CPYNB[11]=2;
+    CPYNB[12]=3; CPYNB[13]=3; CPYNB[14]=4; CPYNB[15]=4; CPYNB[16]=5; CPYNB[17]=5;
+    CPYNB[18]=6; CPYNB[19]=7; CPYNB[20]=8; CPYNB[21]=9; CPYNB[22]=10; CPYNB[23]=24;
+
+    DSCIO[0]=0; DSCIO[1]=3; DSCIO[2]=2; DSCIO[3]=1; DSCIO[4]=0; DSCIO[5]=0; DSCIO[6]=0;
+    DSCIO[7]=0; DSCIO[8]=0; DSCIO[9]=0; DSCIO[10]=3; DSCIO[11]=3; DSCIO[12]=3;
+    DSCIO[13]=3; DSCIO[14]=3; DSCIO[15]=3;
+    DSCVO[0]=0; DSCVO[1]=0; DSCVO[2]=0; DSCVO[3]=0; DSCVO[4]=0-1; DSCVO[5]=1;
+    DSCVO[6]=0-2; DSCVO[7]=2; DSCVO[8]=0-3; DSCVO[9]=3; DSCVO[10]=0-1; DSCVO[11]=1;
+    DSCVO[12]=0-2; DSCVO[13]=2; DSCVO[14]=0-3; DSCVO[15]=3;
+
+    FIXED[0]=0x020000; FIXED[1]=0x020004; FIXED[2]=0x020003; FIXED[3]=0x030002;
+    FIXED[4]=0x020000; FIXED[5]=0x020004; FIXED[6]=0x020003; FIXED[7]=0x040001;
+    FIXED[8]=0x020000; FIXED[9]=0x020004; FIXED[10]=0x020003; FIXED[11]=0x030002;
+    FIXED[12]=0x020000; FIXED[13]=0x020004; FIXED[14]=0x020003; FIXED[15]=0x040005;
+    CLCO[0]=1; CLCO[1]=2; CLCO[2]=3; CLCO[3]=4; CLCO[4]=0; CLCO[5]=5; CLCO[6]=17;
+    CLCO[7]=6; CLCO[8]=16; CLCO[9]=7; CLCO[10]=8; CLCO[11]=9; CLCO[12]=10; CLCO[13]=11;
+    CLCO[14]=12; CLCO[15]=13; CLCO[16]=14; CLCO[17]=15;
+
+    let is i64 as i with mut = 0;
+    while (i < 32) { DSB[i] = 0; i = i + 1; }
+    DSB[4]=10; DSB[5]=10; DSB[6]=11; DSB[7]=11; DSB[8]=10; DSB[9]=10; DSB[10]=10;
+    DSB[11]=10; DSB[12]=10; DSB[13]=9; DSB[14]=9; DSB[15]=8; DSB[16]=7; DSB[17]=7;
+    DSB[18]=8; DSB[19]=7; DSB[20]=7; DSB[21]=6; DSB[22]=6; DSB[23]=5; DSB[24]=5;
+    let is i64 as pos with mut = 0;
+    i = 0;
+    while (i < 32) {
+        DOFF[i] = pos;
+        if (DSB[i] != 0) { pos = pos + (i << DSB[i]); }
+        i = i + 1;
+    }
+
+    MHTS[0]=256; MHTS[1]=402; MHTS[2]=436; MHTS[3]=468; MHTS[4]=500; MHTS[5]=534;
+    MHTS[6]=566; MHTS[7]=598; MHTS[8]=630; MHTS[9]=662; MHTS[10]=694; MHTS[11]=726;
+    MHTS[12]=758; MHTS[13]=790; MHTS[14]=822; MHTS[15]=854; MHTS[16]=886; MHTS[17]=920;
+    MHTS[18]=952; MHTS[19]=984; MHTS[20]=1016; MHTS[21]=1048; MHTS[22]=1080;
+
+    _cmd_init();
+    _ctx_init();
+    _tab_ready = 1;
+}
+
+// ---------------------------------------------------------------- Huffman
+let is *i64 as _sorted with mut;
+let is *i64 as _clen with mut;       // scratch code lengths
+let is i32 as _huf_ready with mut = 0;
+fn _huf_alloc() as void {
+    if (_huf_ready == 1) { return; }
+    _sorted = _ia(1090); _clen = _ia(1090); _huf_ready = 1;
+}
+
+fn _nextKey(key as i64, len as i64) as i64 {
+    let is i64 as step with mut = 1 << (len - 1);
+    while ((key & step) != 0) { step = step >> 1; }
+    return (key & (step - 1)) + step;
+}
+
+fn _nextTableBitSize(count as *i64, len as i64, rootBits as i64) as i64 {
+    let is i64 as bits with mut = len;
+    let is i64 as left with mut = 1 << (bits - rootBits);
+    while (bits < 15) {
+        left = left - count[bits];
+        if (left <= 0) { break; }
+        bits = bits + 1;
+        left = left << 1;
+    }
+    return bits - rootBits;
+}
+
+// Build a two-level Huffman table into group (group[tableIdx] = base offset).
+// Returns number of slots used.
+fn _buildHuff(group as *i64, tableIdx as i64, rootBits as i64, codeLengths as *i64, size as i64) as i64 {
+    let is i64 as tableOffset = group[tableIdx];
+    let is [16]i64 as count;
+    let is [16]i64 as offset;
+    let is i64 as i with mut = 0;
+    while (i < 16) { count[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < size) { count[codeLengths[i]] = count[codeLengths[i]] + 1; i = i + 1; }
+    offset[1] = 0;
+    let is i64 as len with mut = 1;
+    while (len < 15) { offset[len + 1] = offset[len] + count[len]; len = len + 1; }
+    i = 0;
+    while (i < size) {
+        if (codeLengths[i] != 0) { _sorted[offset[codeLengths[i]]] = i; offset[codeLengths[i]] = offset[codeLengths[i]] + 1; }
+        i = i + 1;
+    }
+    let is i64 as tableBits with mut = rootBits;
+    let is i64 as tableSize with mut = 1 << tableBits;
+    let is i64 as totalSize with mut = tableSize;
+
+    if (offset[15] == 1) {
+        let is i64 as k with mut = 0;
+        while (k < totalSize) { group[tableOffset + k] = _sorted[0]; k = k + 1; }
+        return totalSize;
+    }
+
+    let is i64 as key with mut = 0;
+    let is i64 as symbol with mut = 0;
+    let is i64 as step with mut = 1;
+    len = 1;
+    while (len <= rootBits) {
+        step = step << 1;
+        while (count[len] > 0) {
+            let is i64 as item = (len << 16) | _sorted[symbol];
+            symbol = symbol + 1;
+            let is i64 as pos with mut = tableSize;
+            while (pos > 0) { pos = pos - step; group[tableOffset + key + pos] = item; }
+            key = _nextKey(key, len);
+            count[len] = count[len] - 1;
+        }
+        len = len + 1;
+    }
+
+    let is i64 as mask = totalSize - 1;
+    let is i64 as low with mut = 0 - 1;
+    let is i64 as currentOffset with mut = tableOffset;
+    step = 1;
+    len = rootBits + 1;
+    while (len <= 15) {
+        step = step << 1;
+        while (count[len] > 0) {
+            if ((key & mask) != low) {
+                currentOffset = currentOffset + tableSize;
+                tableBits = _nextTableBitSize(cast(*i64, &count), len, rootBits);
+                tableSize = 1 << tableBits;
+                totalSize = totalSize + tableSize;
+                low = key & mask;
+                group[tableOffset + low] = ((tableBits + rootBits) << 16) | (currentOffset - tableOffset - low);
+            }
+            let is i64 as item = ((len - rootBits) << 16) | _sorted[symbol];
+            symbol = symbol + 1;
+            let is i64 as base = currentOffset + (key >> rootBits);
+            let is i64 as pos with mut = tableSize;
+            while (pos > 0) { pos = pos - step; group[base + pos] = item; }
+            key = _nextKey(key, len);
+            count[len] = count[len] - 1;
+        }
+        len = len + 1;
+    }
+    return totalSize;
+}
+
+fn _readSym(group as *i64, tableIdx as i64) as i64 {
+    let is i64 as off with mut = group[tableIdx];
+    let is i64 as v = _peek(16);
+    off = off + (v & 0xFF);
+    let is i64 as entry = group[off];
+    let is i64 as bits = entry >> 16;
+    let is i64 as sym = entry & 0xFFFF;
+    if (bits <= 8) { _bitp = _bitp + bits; return sym; }
+    off = off + sym;
+    off = off + ((v & ((1 << bits) - 1)) >> 8);
+    let is i64 as entry2 = group[off];
+    _bitp = _bitp + ((entry2 >> 16) + 8);
+    return entry2 & 0xFFFF;
+}
+
+// ---------------------------------------------------------------- state
+let is [16]i64 as _rings;
+let is i64 as _distRbIdx with mut;
+let is i64 as _mbLen with mut;
+let is i64 as _inputEnd with mut;
+let is i64 as _isUncompressed with mut;
+let is i64 as _isMetadata with mut;
+let is i64 as _numLitTypes with mut;
+let is i64 as _numCmdTypes with mut;
+let is i64 as _numDistTypes with mut;
+let is i64 as _litBlockLen with mut;
+let is i64 as _cmdBlockLen with mut;
+let is i64 as _distBlockLen with mut;
+let is *i64 as _contextMap with mut;
+let is *i64 as _distContextMap with mut;
+let is *i64 as _contextModes with mut;
+let is i64 as _contextMapSlice with mut;
+let is i64 as _distContextMapSlice with mut;
+let is i64 as _ctxLook1 with mut;
+let is i64 as _ctxLook2 with mut;
+let is i64 as _litTreeIdx with mut;
+let is i64 as _cmdTreeIdx with mut;
+let is i64 as _trivialLit with mut;
+let is *i64 as _litGroup with mut;
+let is *i64 as _cmdGroup with mut;
+let is *i64 as _distGroup with mut;
+let is *i64 as _blockTrees with mut;
+let is i64 as _npostfix with mut;
+let is i64 as _ndirect with mut;
+let is *i64 as _distExtra with mut;
+let is *i64 as _distOff with mut;
+let is i64 as _maxBackward with mut;
+let is i64 as _maxDist with mut;
+
+fn _decodeVarLenByte() as i64 {
+    if (_take(1) != 0) {
+        let is i64 as n = _take(3);
+        if (n == 0) { return 1; }
+        return _take(n) + (1 << n);
+    }
+    return 0;
+}
+
+fn _decodeWindowBits() as i64 {
+    if (_take(1) == 0) { return 16; }
+    let is i64 as n with mut = _take(3);
+    if (n != 0) { return 17 + n; }
+    n = _take(3);
+    if (n != 0) {
+        if (n == 1) { return 0 - 1; }   // large-window: unsupported
+        return 8 + n;
+    }
+    return 17;
+}
+
+fn _decodeMetaBlockLength() as i64 {
+    _inputEnd = _take(1);
+    _mbLen = 0;
+    _isUncompressed = 0;
+    _isMetadata = 0;
+    if (_inputEnd != 0) {
+        if (_take(1) != 0) { return 0; }
+    }
+    let is i64 as sizeNibbles = _take(2) + 4;
+    if (sizeNibbles == 7) {
+        _isMetadata = 1;
+        if (_take(1) != 0) { return errno.Z_BADHDR; }
+        let is i64 as sizeBytes = _take(2);
+        let is i64 as i with mut = 0;
+        while (i < sizeBytes) {
+            let is i64 as bits = _take(8);
+            _mbLen = _mbLen + (bits << (i * 8));
+            i = i + 1;
+        }
+    } else {
+        let is i64 as i with mut = 0;
+        while (i < sizeNibbles) {
+            let is i64 as bits = _take(4);
+            _mbLen = _mbLen + (bits << (i * 4));
+            i = i + 1;
+        }
+    }
+    _mbLen = _mbLen + 1;
+    if (_inputEnd == 0) { _isUncompressed = _take(1); }
+    return 0;
+}
+
+fn _moveToFront(v as *i64, index as i64) as void {
+    let is i64 as value = v[index];
+    let is i64 as i with mut = index;
+    while (i > 0) { v[i] = v[i - 1]; i = i - 1; }
+    v[0] = value;
+}
+
+fn _inverseMTF(v as *i64, vLen as i64) as void {
+    let is [256]i64 as mtf;
+    let is i64 as i with mut = 0;
+    while (i < 256) { mtf[i] = i; i = i + 1; }
+    i = 0;
+    while (i < vLen) {
+        let is i64 as index = v[i] & 0xFF;
+        v[i] = mtf[index];
+        if (index != 0) { _moveToFront(cast(*i64, &mtf), index); }
+        i = i + 1;
+    }
+}
+
+fn _readHuffmanCodeLengths(clcl as *i64, numSymbols as i64, codeLengths as *i64) as i64 {
+    let is i64 as symbol with mut = 0;
+    let is i64 as prevCodeLen with mut = 8;
+    let is i64 as repeat with mut = 0;
+    let is i64 as repeatCodeLen with mut = 0;
+    let is i64 as space with mut = 32768;
+    let is *i64 as table = _ia(33);
+    table[32] = 0;
+    _buildHuff(table, 32, 5, clcl, 18);
+
+    while (symbol < numSymbols) {
+        if (space <= 0) { break; }
+        let is i64 as p = _peek(5) & 31;
+        _bitp = _bitp + (table[p] >> 16);
+        let is i64 as codeLen = table[p] & 0xFFFF;
+        if (codeLen < 16) {
+            repeat = 0;
+            codeLengths[symbol] = codeLen;
+            symbol = symbol + 1;
+            if (codeLen != 0) { prevCodeLen = codeLen; space = space - (32768 >> codeLen); }
+        } else {
+            let is i64 as extraBits = codeLen - 14;
+            let is i64 as newLen with mut = 0;
+            if (codeLen == 16) { newLen = prevCodeLen; }
+            if (repeatCodeLen != newLen) { repeat = 0; repeatCodeLen = newLen; }
+            let is i64 as oldRepeat = repeat;
+            if (repeat > 0) { repeat = repeat - 2; repeat = repeat << extraBits; }
+            repeat = repeat + _take(extraBits) + 3;
+            let is i64 as repeatDelta = repeat - oldRepeat;
+            if (symbol + repeatDelta > numSymbols) { return errno.Z_BADHUFF; }
+            let is i64 as i with mut = 0;
+            while (i < repeatDelta) { codeLengths[symbol] = repeatCodeLen; symbol = symbol + 1; i = i + 1; }
+            if (repeatCodeLen != 0) { space = space - (repeatDelta << (15 - repeatCodeLen)); }
+        }
+    }
+    if (space != 0) { return errno.Z_BADHUFF; }
+    let is i64 as i with mut = symbol;
+    while (i < numSymbols) { codeLengths[i] = 0; i = i + 1; }
+    return 0;
+}
+
+fn _log2floor(x as i64) as i64 {
+    let is i64 as r with mut = 0 - 1;
+    let is i64 as v with mut = x;
+    while (v != 0) { r = r + 1; v = v >> 1; }
+    return r;
+}
+
+fn _readSimpleHuffman(alphaMax as i64, alphaLimit as i64, group as *i64, tableIdx as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < alphaLimit) { _clen[i] = 0; i = i + 1; }
+    let is [4]i64 as symbols;
+    let is i64 as maxBits = 1 + _log2floor(alphaMax - 1);
+    let is i64 as numSymbols = _take(2) + 1;
+    i = 0;
+    while (i < numSymbols) {
+        let is i64 as symbol = _take(maxBits);
+        if (symbol >= alphaLimit) { return errno.Z_BADHUFF; }
+        symbols[i] = symbol;
+        i = i + 1;
+    }
+    let is i64 as histogramId with mut = numSymbols;
+    if (numSymbols == 4) { histogramId = histogramId + _take(1); }
+    if (histogramId == 1) {
+        _clen[symbols[0]] = 1;
+    } else if (histogramId == 2) {
+        _clen[symbols[0]] = 1; _clen[symbols[1]] = 1;
+    } else if (histogramId == 3) {
+        _clen[symbols[0]] = 1; _clen[symbols[1]] = 2; _clen[symbols[2]] = 2;
+    } else if (histogramId == 4) {
+        _clen[symbols[0]] = 2; _clen[symbols[1]] = 2; _clen[symbols[2]] = 2; _clen[symbols[3]] = 2;
+    } else if (histogramId == 5) {
+        _clen[symbols[0]] = 1; _clen[symbols[1]] = 2; _clen[symbols[2]] = 3; _clen[symbols[3]] = 3;
+    }
+    return _buildHuff(group, tableIdx, 8, _clen, alphaLimit);
+}
+
+fn _readComplexHuffman(alphaLimit as i64, skip as i64, group as *i64, tableIdx as i64) as i64 {
+    let is [18]i64 as clcl;
+    let is i64 as i with mut = 0;
+    while (i < 18) { clcl[i] = 0; i = i + 1; }
+    let is i64 as space with mut = 32;
+    let is i64 as numCodes with mut = 0;
+    i = skip;
+    while (i < 18) {
+        let is i64 as codeLenIdx = CLCO[i];
+        let is i64 as p = _peek(4) & 15;
+        _bitp = _bitp + (FIXED[p] >> 16);
+        let is i64 as v = FIXED[p] & 0xFFFF;
+        clcl[codeLenIdx] = v;
+        if (v != 0) {
+            space = space - (32 >> v);
+            numCodes = numCodes + 1;
+            if (space <= 0) { break; }
+        }
+        i = i + 1;
+    }
+    if (space != 0) { if (numCodes != 1) { return errno.Z_BADHUFF; } }
+    i = 0;
+    while (i < alphaLimit) { _clen[i] = 0; i = i + 1; }
+    let is i64 as r = _readHuffmanCodeLengths(cast(*i64, &clcl), alphaLimit, _clen);
+    if (r < 0) { return r; }
+    return _buildHuff(group, tableIdx, 8, _clen, alphaLimit);
+}
+
+fn _readHuffmanCode(alphaMax as i64, alphaLimit as i64, group as *i64, tableIdx as i64) as i64 {
+    let is i64 as simpleCodeOrSkip = _take(2);
+    if (simpleCodeOrSkip == 1) { return _readSimpleHuffman(alphaMax, alphaLimit, group, tableIdx); }
+    return _readComplexHuffman(alphaLimit, simpleCodeOrSkip, group, tableIdx);
+}
+
+fn _decodeContextMap(contextMapSize as i64, contextMap as *i64) as i64 {
+    let is i64 as numTrees = _decodeVarLenByte() + 1;
+    if (numTrees == 1) {
+        let is i64 as i with mut = 0;
+        while (i < contextMapSize) { contextMap[i] = 0; i = i + 1; }
+        return numTrees;
+    }
+    let is i64 as useRle = _take(1);
+    let is i64 as maxRun with mut = 0;
+    if (useRle != 0) { maxRun = _take(4) + 1; }
+    let is i64 as alphabetSize = numTrees + maxRun;
+    let is i64 as tableSize = MHTS[(alphabetSize + 31) >> 5];
+    let is *i64 as table = _ia(tableSize + 1);
+    table[tableSize] = 0;
+    let is i64 as rr = _readHuffmanCode(alphabetSize, alphabetSize, table, tableSize);
+    if (rr < 0) { return rr; }
+    let is i64 as i with mut = 0;
+    while (i < contextMapSize) {
+        let is i64 as code = _readSym(table, tableSize);
+        if (code == 0) {
+            contextMap[i] = 0; i = i + 1;
+        } else if (code <= maxRun) {
+            let is i64 as reps with mut = (1 << code) + _take(code);
+            while (reps != 0) {
+                if (i >= contextMapSize) { return errno.Z_BADHDR; }
+                contextMap[i] = 0; i = i + 1; reps = reps - 1;
+            }
+        } else {
+            contextMap[i] = code - maxRun; i = i + 1;
+        }
+    }
+    if (_take(1) == 1) { _inverseMTF(contextMap, contextMapSize); }
+    return numTrees;
+}
+
+fn _readBlockLength(group as *i64, tableIdx as i64) as i64 {
+    let is i64 as code = _readSym(group, tableIdx);
+    let is i64 as n = BLNB[code];
+    return BLOFF[code] + _take(n);
+}
+
+fn _decodeBlockTypeAndLength(treeType as i64, numBlockTypes as i64) as i64 {
+    let is i64 as offset = 4 + treeType * 2;
+    let is i64 as blockType with mut = _readSym(_blockTrees, 2 * treeType);
+    let is i64 as result = _readBlockLength(_blockTrees, 2 * treeType + 1);
+    if (blockType == 1) { blockType = _rings[offset + 1] + 1; }
+    else if (blockType == 0) { blockType = _rings[offset]; }
+    else { blockType = blockType - 2; }
+    if (blockType >= numBlockTypes) { blockType = blockType - numBlockTypes; }
+    _rings[offset] = _rings[offset + 1];
+    _rings[offset + 1] = blockType;
+    return result;
+}
+
+fn _decodeLitBlockSwitch() as void {
+    _litBlockLen = _decodeBlockTypeAndLength(0, _numLitTypes);
+    let is i64 as litType = _rings[5];
+    _contextMapSlice = litType << 6;
+    _litTreeIdx = _contextMap[_contextMapSlice] & 0xFF;
+    let is i64 as cm = _contextModes[litType];
+    _ctxLook1 = cm << 9;
+    _ctxLook2 = _ctxLook1 + 256;
+}
+
+fn _decodeCmdBlockSwitch() as void {
+    _cmdBlockLen = _decodeBlockTypeAndLength(1, _numCmdTypes);
+    _cmdTreeIdx = _rings[7];
+}
+
+fn _decodeDistBlockSwitch() as void {
+    _distBlockLen = _decodeBlockTypeAndLength(2, _numDistTypes);
+    _distContextMapSlice = _rings[9] << 2;
+}
+
+fn _readMetablockPartition(treeType as i64, numBlockTypes as i64) as i64 {
+    let is i64 as offset with mut = _blockTrees[2 * treeType];
+    if (numBlockTypes <= 1) {
+        _blockTrees[2 * treeType + 1] = offset;
+        _blockTrees[2 * treeType + 2] = offset;
+        return 1 << 28;
+    }
+    let is i64 as blockTypeAlpha = numBlockTypes + 2;
+    let is i64 as r1 = _readHuffmanCode(blockTypeAlpha, blockTypeAlpha, _blockTrees, 2 * treeType);
+    if (r1 < 0) { return r1; }
+    offset = offset + r1;
+    _blockTrees[2 * treeType + 1] = offset;
+    let is i64 as r2 = _readHuffmanCode(26, 26, _blockTrees, 2 * treeType + 1);
+    if (r2 < 0) { return r2; }
+    offset = offset + r2;
+    _blockTrees[2 * treeType + 2] = offset;
+    return _readBlockLength(_blockTrees, 2 * treeType + 1);
+}
+
+fn _calcDistLut(alphaLimit as i64) as void {
+    let is i64 as postfix = 1 << _npostfix;
+    let is i64 as bits with mut = 1;
+    let is i64 as half with mut = 0;
+    let is i64 as i with mut = 16;
+    let is i64 as j with mut = 0;
+    while (j < _ndirect) {
+        _distExtra[i] = 0; _distOff[i] = j + 1; i = i + 1; j = j + 1;
+    }
+    while (i < alphaLimit) {
+        let is i64 as base = _ndirect + ((((2 + half) << bits) - 4) << _npostfix) + 1;
+        let is i64 as k with mut = 0;
+        while (k < postfix) {
+            _distExtra[i] = bits; _distOff[i] = base + k; i = i + 1; k = k + 1;
+        }
+        bits = bits + half;
+        half = half ^ 1;
+    }
+}
+
+fn _treeGroupAllocSize(alphaLimit as i64, n as i64) as i64 {
+    return n + n * MHTS[(alphaLimit + 31) >> 5];
+}
+
+fn _decodeTreeGroup(group as *i64, alphaMax as i64, alphaLimit as i64, n as i64) as i64 {
+    let is i64 as next with mut = n;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        group[i] = next;
+        let is i64 as r = _readHuffmanCode(alphaMax, alphaLimit, group, i);
+        if (r < 0) { return r; }
+        next = next + r;
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _readMetablockHuffman() as i64 {
+    _numLitTypes = _decodeVarLenByte() + 1;
+    _litBlockLen = _readMetablockPartition(0, _numLitTypes);
+    if (_litBlockLen < 0) { return _litBlockLen; }
+    _numCmdTypes = _decodeVarLenByte() + 1;
+    _cmdBlockLen = _readMetablockPartition(1, _numCmdTypes);
+    if (_cmdBlockLen < 0) { return _cmdBlockLen; }
+    _numDistTypes = _decodeVarLenByte() + 1;
+    _distBlockLen = _readMetablockPartition(2, _numDistTypes);
+    if (_distBlockLen < 0) { return _distBlockLen; }
+
+    _npostfix = _take(2);
+    _ndirect = _take(4) << _npostfix;
+    _contextModes = _ia(_numLitTypes);
+    let is i64 as i with mut = 0;
+    while (i < _numLitTypes) { _contextModes[i] = _take(2); i = i + 1; }
+
+    let is i64 as cmLen = _numLitTypes << 6;
+    _contextMap = _ia(cmLen);
+    let is i64 as numLitTrees = _decodeContextMap(cmLen, _contextMap);
+    if (numLitTrees < 0) { return numLitTrees; }
+    _trivialLit = 1;
+    i = 0;
+    while (i < cmLen) {
+        if (_contextMap[i] != (i >> 6)) { _trivialLit = 0; i = cmLen; }
+        else { i = i + 1; }
+    }
+
+    let is i64 as dcmLen = _numDistTypes << 2;
+    _distContextMap = _ia(dcmLen);
+    let is i64 as numDistTrees = _decodeContextMap(dcmLen, _distContextMap);
+    if (numDistTrees < 0) { return numDistTrees; }
+
+    _litGroup = _ia(_treeGroupAllocSize(256, numLitTrees));
+    let is i64 as r1 = _decodeTreeGroup(_litGroup, 256, 256, numLitTrees);
+    if (r1 < 0) { return r1; }
+    _cmdGroup = _ia(_treeGroupAllocSize(704, _numCmdTypes));
+    let is i64 as r2 = _decodeTreeGroup(_cmdGroup, 704, 704, _numCmdTypes);
+    if (r2 < 0) { return r2; }
+    let is i64 as distAlpha = 16 + _ndirect + 2 * (24 << _npostfix);
+    _distGroup = _ia(_treeGroupAllocSize(distAlpha, numDistTrees));
+    let is i64 as r3 = _decodeTreeGroup(_distGroup, distAlpha, distAlpha, numDistTrees);
+    if (r3 < 0) { return r3; }
+    _calcDistLut(distAlpha);
+
+    _contextMapSlice = 0;
+    _distContextMapSlice = 0;
+    _ctxLook1 = _contextModes[0] * 512;
+    _ctxLook2 = _ctxLook1 + 256;
+    _litTreeIdx = 0;
+    _cmdTreeIdx = 0;
+    _rings[4] = 1; _rings[5] = 0; _rings[6] = 1; _rings[7] = 0; _rings[8] = 1; _rings[9] = 0;
+    return 0;
+}
+
+// transform dictionary word at DICT[wordOffset..] of length wordLen, write into tmp, return length
+fn _transformWord(tmp as *u8, wordOffset as i64, wordLen as i64, ti as i64) as i64 {
+    let is *u8 as dict = bd.dict();
+    let is i64 as prefixIdx = bt.TRANS[3 * ti];
+    let is i64 as ttype = bt.TRANS[3 * ti + 1];
+    let is i64 as suffixIdx = bt.TRANS[3 * ti + 2];
+    let is i64 as o with mut = 0;
+
+    // prefix (length-prefixed string at PFXS[PFXMAP[prefixIdx]])
+    let is i64 as p with mut = bt.PFXMAP[prefixIdx];
+    let is i64 as plen = cast(i64, bt.PFXS[p]);
+    p = p + 1;
+    let is i64 as pk with mut = 0;
+    while (pk < plen) { tmp[o] = bt.PFXS[p]; o = o + 1; p = p + 1; pk = pk + 1; }
+
+    let is i64 as omitFirst with mut = ttype - 11;
+    let is i64 as omitLast with mut = ttype;
+    if (omitFirst < 1) { omitFirst = 0; } else if (omitFirst > 9) { omitFirst = 0; }
+    if (omitLast < 1) { omitLast = 0; } else if (omitLast > 9) { omitLast = 0; }
+
+    let is i64 as len with mut = wordLen;
+    if (omitFirst > len) { omitFirst = len; }
+    let is i64 as di with mut = wordOffset + omitFirst;
+    len = len - omitFirst - omitLast;
+    let is i64 as wordStart = o;
+    let is i64 as i with mut = len;
+    while (i > 0) { tmp[o] = dict[di]; o = o + 1; di = di + 1; i = i - 1; }
+
+    // ferment: uppercase
+    if (ttype == 10 || ttype == 11) {
+        let is i64 as uo with mut = wordStart;
+        let is i64 as ul with mut = len;
+        if (ttype == 10) { ul = 1; }
+        while (ul > 0) {
+            let is i64 as c0 = cast(i64, tmp[uo]);
+            if (c0 < 0xC0) {
+                if (c0 >= 97) { if (c0 <= 122) { tmp[uo] = cast(u8, c0 ^ 32); } }
+                uo = uo + 1; ul = ul - 1;
+            } else if (c0 < 0xE0) {
+                tmp[uo + 1] = cast(u8, cast(i64, tmp[uo + 1]) ^ 32);
+                uo = uo + 2; ul = ul - 2;
+            } else {
+                tmp[uo + 2] = cast(u8, cast(i64, tmp[uo + 2]) ^ 5);
+                uo = uo + 3; ul = ul - 3;
+            }
+        }
+    }
+
+    // suffix (length-prefixed)
+    let is i64 as sp with mut = bt.PFXMAP[suffixIdx];
+    let is i64 as slen = cast(i64, bt.PFXS[sp]);
+    sp = sp + 1;
+    let is i64 as sk with mut = 0;
+    while (sk < slen) { tmp[o] = bt.PFXS[sp]; o = o + 1; sp = sp + 1; sk = sk + 1; }
+    return o;
+}
+
+// ---------------------------------------------------------------- main
+fn brotli_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    _tabs();
+    _huf_alloc();
+    _src = src; _slen = src_len; _bitp = 0;
+    _inputEnd = 0; _isUncompressed = 0; _isMetadata = 0; _mbLen = 0;
+
+    _blockTrees = _ia(3120);
+    _blockTrees[0] = 7;
+    _distExtra = _ia(700);
+    _distOff = _ia(700);
+    _distRbIdx = 3;
+    _rings[0] = 16; _rings[1] = 15; _rings[2] = 11; _rings[3] = 4;
+    _maxDist = 0;
+
+    let is i64 as windowBits = _decodeWindowBits();
+    if (windowBits < 0) { return errno.Z_BADHDR; }
+    _maxBackward = (1 << windowBits) - 16;
+
+    let is *u8 as tmp = mem.core.mmap_anon(64);
+
+    while (1 == 1) {
+        if (_inputEnd != 0) { break; }
+        let is i64 as r = _decodeMetaBlockLength();
+        if (r < 0) { return r; }
+        if (_mbLen == 0) { if (_isMetadata == 0) { continue; } }
+
+        if (_isMetadata != 0) {
+            _balign();
+            _bitp = _bitp + _mbLen * 8;          // skip metadata bytes
+            continue;
+        }
+        if (_isUncompressed != 0) {
+            _balign();
+            let is i64 as bytePos = _bitp >> 3;
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + bytePos), _mbLen) < 0) { return errno.Z_OOM; }
+            _bitp = _bitp + _mbLen * 8;
+            continue;
+        }
+
+        let is i64 as rh = _readMetablockHuffman();
+        if (rh < 0) { return rh; }
+
+        // command loop
+        while (_mbLen > 0) {
+            if (_cmdBlockLen == 0) { _decodeCmdBlockSwitch(); }
+            _cmdBlockLen = _cmdBlockLen - 1;
+            let is i64 as cmdCode = _readSym(_cmdGroup, _cmdTreeIdx) << 2;
+            let is i64 as insAndCopy = CMD[cmdCode];
+            let is i64 as insLength with mut = CMD[cmdCode + 1] + _take(insAndCopy & 0xFF);
+            let is i64 as copyLength = CMD[cmdCode + 2] + _take(insAndCopy >> 8);
+            let is i64 as cmdDistCtx = CMD[cmdCode + 3];
+
+            // insert literals
+            let is i64 as j with mut = 0;
+            if (_trivialLit != 0) {
+                while (j < insLength) {
+                    if (_litBlockLen == 0) { _decodeLitBlockSwitch(); }
+                    _litBlockLen = _litBlockLen - 1;
+                    let is i64 as lit = _readSym(_litGroup, _litTreeIdx);
+                    if (bytes.bytes_push(out, cast(u8, lit)) < 0) { return errno.Z_OOM; }
+                    j = j + 1;
+                }
+            } else {
+                while (j < insLength) {
+                    let is i64 as p1 with mut = 0;
+                    let is i64 as p2 with mut = 0;
+                    if (out.len > 0) { p1 = cast(i64, out.ptr[out.len - 1]); }
+                    if (out.len > 1) { p2 = cast(i64, out.ptr[out.len - 2]); }
+                    if (_litBlockLen == 0) { _decodeLitBlockSwitch(); }
+                    let is i64 as litCtx = CTX[_ctxLook1 + p1] | CTX[_ctxLook2 + p2];
+                    let is i64 as treeIdx = _contextMap[_contextMapSlice + litCtx] & 0xFF;
+                    _litBlockLen = _litBlockLen - 1;
+                    let is i64 as lit = _readSym(_litGroup, treeIdx);
+                    if (bytes.bytes_push(out, cast(u8, lit)) < 0) { return errno.Z_OOM; }
+                    j = j + 1;
+                }
+            }
+            _mbLen = _mbLen - insLength;
+            if (_mbLen <= 0) { break; }
+
+            // distance
+            let is i64 as distSym with mut = cmdDistCtx;
+            let is i64 as distance with mut = 0;
+            if (cmdDistCtx < 0) {
+                distance = _rings[_distRbIdx];
+            } else {
+                if (_distBlockLen == 0) { _decodeDistBlockSwitch(); }
+                _distBlockLen = _distBlockLen - 1;
+                let is i64 as dti = _distContextMap[_distContextMapSlice + cmdDistCtx] & 0xFF;
+                distSym = _readSym(_distGroup, dti);
+                if (distSym < 16) {
+                    let is i64 as index = (_distRbIdx + DSCIO[distSym]) & 3;
+                    distance = _rings[index] + DSCVO[distSym];
+                    if (distance < 0) { return errno.Z_BADDIST; }
+                } else {
+                    let is i64 as extra = _distExtra[distSym];
+                    let is i64 as ebits = _take(extra);
+                    distance = _distOff[distSym] + (ebits << _npostfix);
+                }
+            }
+
+            _maxDist = _maxBackward;
+            if (out.len < _maxBackward) { _maxDist = out.len; }
+
+            if (distance > _maxDist) {
+                // dictionary reference
+                let is i64 as address = distance - _maxDist - 1;
+                let is i64 as wordLen = copyLength;
+                if (wordLen > 31) { return errno.Z_BADDIST; }
+                let is i64 as shift = DSB[wordLen];
+                if (shift == 0) { return errno.Z_BADDIST; }
+                let is i64 as mask = (1 << shift) - 1;
+                let is i64 as wordIdx = address & mask;
+                let is i64 as transformIdx = address >> shift;
+                let is i64 as wordOffset = DOFF[wordLen] + wordIdx * wordLen;
+                if (transformIdx >= bt.NUM_TRANSFORMS) { return errno.Z_BADDIST; }
+                let is i64 as tlen = _transformWord(tmp, wordOffset, wordLen, transformIdx);
+                if (bytes.bytes_append(out, tmp, tlen) < 0) { return errno.Z_OOM; }
+                _mbLen = _mbLen - tlen;
+            } else {
+                if (distSym > 0) {
+                    _distRbIdx = (_distRbIdx + 1) & 3;
+                    _rings[_distRbIdx] = distance;
+                }
+                if (copyLength > _mbLen) { return errno.Z_BADDIST; }
+                // overlap-safe copy from out[out.len - distance]
+                if (distance > out.len) { return errno.Z_BADDIST; }
+                if (bytes.bytes_reserve(out, copyLength) < 0) { return errno.Z_OOM; }
+                let is i64 as sp with mut = out.len - distance;
+                let is i64 as dp with mut = out.len;
+                let is i64 as e = out.len + copyLength;
+                while (dp < e) { out.ptr[dp] = out.ptr[sp]; sp = sp + 1; dp = dp + 1; }
+                out.len = e;
+                _mbLen = _mbLen - copyLength;
+            }
+        }
+    }
+    return out.len;
+}
