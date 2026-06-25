@@ -20,6 +20,7 @@ use "../formats/lz4.cst" as lz4;
 use "../formats/snappy.cst" as snappy;
 use "../formats/lzma.cst" as lzma;
 use "../formats/xz.cst" as xz;
+use "../formats/bzip2.cst" as bzip2;
 
 // --- shared helpers ----------------------------------------------------
 fn _alloc(n as i64) as *u8 { return mem.core.mmap_anon(n); }
@@ -48,6 +49,7 @@ fn _decode(kind as i64, comp as *u8, clen as i64, out as *bytes.Bytes) as i64 {
     if (kind == 4) { return snappy.snappy_decompress(comp, clen, out); }
     if (kind == 5) { return lzma.lzma_alone_decompress(comp, clen, out); }
     if (kind == 6) { return xz.xz_decompress(comp, clen, out); }
+    if (kind == 7) { return bzip2.bzip2_decompress(comp, clen, out); }
     return 0 - 1;
 }
 
@@ -243,6 +245,16 @@ fn suite_xz() as i64 {
     return b;
 }
 
+fn suite_bzip2() as i64 {
+    io.write_str(io.STDOUT, "[bzip2]\n");
+    let is i64 as b with mut = 0;
+    b = b + check(7, "hello",  "tests/fixtures/hello.bz2",  "tests/fixtures/hello.bin");
+    b = b + check(7, "lorem",  "tests/fixtures/lorem.bz2",  "tests/fixtures/lorem.bin");
+    b = b + check(7, "window", "tests/fixtures/window.bz2", "tests/fixtures/window.bin");
+    b = b + check(7, "big",    "tests/fixtures/big.bz2",    "tests/fixtures/big.bin");
+    return b;
+}
+
 fn main() as i32 {
     let is i64 as bad with mut = 0;
     bad = bad + suite_core();
@@ -253,6 +265,7 @@ fn main() as i32 {
     bad = bad + suite_snappy();
     bad = bad + suite_lzma();
     bad = bad + suite_xz();
+    bad = bad + suite_bzip2();
     if (bad == 0) {
         io.write_str(io.STDOUT, "\nall green\n");
     } else {

@@ -1,0 +1,291 @@
+// =======================================================
+// caustic-compact/formats/bzip2.cst
+// bzip2 decompression. Pipeline per block: MSB-first bit reader -> symbol
+// map -> group selectors (MTF) -> per-group canonical Huffman tables ->
+// MTF + RUNA/RUNB run-length decode -> inverse Burrows-Wheeler transform ->
+// RLE1 decode. Checks are not verified (decode only).
+//   bzip2_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "std/mem.cst" only bins, core as mem;
+
+// MSB-first bit reader (bzip2 packs bits most-significant first).
+struct BzBits {
+    src as *u8; len as i64; pos as i64; buf as i64; n as i64;
+}
+
+fn _bit(b as *BzBits) as i64 {
+    if (b.n == 0) {
+        if (b.pos >= b.len) { return 0; }
+        b.buf = cast(i64, b.src[b.pos]);
+        b.pos = b.pos + 1;
+        b.n = 8;
+    }
+    b.n = b.n - 1;
+    return (b.buf >> b.n) & 1;
+}
+
+fn _bits(b as *BzBits, count as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        v = (v << 1) | _bit(b);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _i64arr(n as i64) as *i64 { return cast(*i64, mem.core.mmap_anon(n * 8)); }
+
+// Decode one bzip2 stream into `out`. Assumes the 4-byte "BZhN" header.
+fn bzip2_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    if (src_len < 4) { return errno.Z_BADHDR; }
+    if (cast(i64, src[0]) != 0x42) { return errno.Z_BADHDR; }   // 'B'
+    if (cast(i64, src[1]) != 0x5A) { return errno.Z_BADHDR; }   // 'Z'
+    if (cast(i64, src[2]) != 0x68) { return errno.Z_BADHDR; }   // 'h'
+    let is i64 as level = cast(i64, src[3]) - 48;
+    if (level < 1) { return errno.Z_BADHDR; }
+    if (level > 9) { return errno.Z_BADHDR; }
+    let is i64 as maxBlock = level * 100000 + 10;
+
+    let is BzBits as b;
+    b.src = src; b.len = src_len; b.pos = 4; b.buf = 0; b.n = 0;
+
+    // per-stream scratch (reused across blocks)
+    let is *i64 as lens   = _i64arr(6 * 258);
+    let is *i64 as perm   = _i64arr(6 * 258);
+    let is *i64 as limit  = _i64arr(6 * 25);
+    let is *i64 as base   = _i64arr(6 * 25);
+    let is *i64 as minLens = _i64arr(6);
+    let is *i64 as selectors = _i64arr(32768);
+    let is *i64 as bwt = _i64arr(maxBlock);
+    let is *i64 as tt  = _i64arr(maxBlock);
+    if (cast(i64, tt) <= 0) { return errno.Z_OOM; }
+
+    let is [256]i64 as symMap;
+    let is [256]i64 as mtf;
+    let is [256]i64 as unzftab;
+    let is [257]i64 as cftab;
+    let is [6]i64 as gmtf;
+
+    while (1 == 1) {
+        // 48-bit block magic
+        let is i64 as hi = _bits(&b, 24);
+        let is i64 as lo = _bits(&b, 24);
+        if (hi == 0x177245) {                  // stream end (.387245385090)
+            return out.len;
+        }
+        if (hi != 0x314159) { return errno.Z_BADHDR; }
+        if (lo != 0x265359) { return errno.Z_BADHDR; }
+
+        let is i64 as junk1 = _bits(&b, 32);   // block CRC (not verified)
+        if (_bit(&b) != 0) { return errno.Z_BADTYPE; }   // randomized: unsupported
+        let is i64 as origPtr = _bits(&b, 24);
+
+        // symbol map: 16-bit group mask + 16 bits per used group
+        let is i64 as used16 = _bits(&b, 16);
+        let is i64 as nInUse with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < 16) {
+            if (((used16 >> (15 - i)) & 1) == 1) {
+                let is i64 as bits16 = _bits(&b, 16);
+                let is i64 as j with mut = 0;
+                while (j < 16) {
+                    if (((bits16 >> (15 - j)) & 1) == 1) {
+                        symMap[nInUse] = i * 16 + j;
+                        nInUse = nInUse + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        let is i64 as alphaSize = nInUse + 2;
+        let is i64 as EOB = nInUse + 1;
+
+        let is i64 as nGroups = _bits(&b, 3);
+        let is i64 as nSelectors = _bits(&b, 15);
+
+        // selectors: unary-coded MTF indices over group numbers
+        i = 0;
+        while (i < nGroups) { gmtf[i] = i; i = i + 1; }
+        let is i64 as s with mut = 0;
+        while (s < nSelectors) {
+            let is i64 as jj with mut = 0;
+            while (_bit(&b) == 1) { jj = jj + 1; }
+            let is i64 as v = gmtf[jj];
+            let is i64 as k with mut = jj;
+            while (k > 0) { gmtf[k] = gmtf[k - 1]; k = k - 1; }
+            gmtf[0] = v;
+            selectors[s] = v;
+            s = s + 1;
+        }
+
+        // per-group code lengths (delta-coded) and decode tables
+        let is i64 as g with mut = 0;
+        while (g < nGroups) {
+            let is i64 as curr with mut = _bits(&b, 5);
+            let is i64 as si with mut = 0;
+            while (si < alphaSize) {
+                while (_bit(&b) == 1) {
+                    if (_bit(&b) == 0) { curr = curr + 1; } else { curr = curr - 1; }
+                }
+                lens[g * 258 + si] = curr;
+                si = si + 1;
+            }
+            // build limit/base/perm (BZ2_hbCreateDecodeTables)
+            let is i64 as minLen with mut = 32;
+            let is i64 as maxLen with mut = 0;
+            si = 0;
+            while (si < alphaSize) {
+                let is i64 as L = lens[g * 258 + si];
+                if (L > maxLen) { maxLen = L; }
+                if (L < minLen) { minLen = L; }
+                si = si + 1;
+            }
+            let is i64 as pp with mut = 0;
+            let is i64 as L2 with mut = minLen;
+            while (L2 <= maxLen) {
+                si = 0;
+                while (si < alphaSize) {
+                    if (lens[g * 258 + si] == L2) { perm[g * 258 + pp] = si; pp = pp + 1; }
+                    si = si + 1;
+                }
+                L2 = L2 + 1;
+            }
+            i = 0;
+            while (i < 25) { base[g * 25 + i] = 0; i = i + 1; }
+            si = 0;
+            while (si < alphaSize) {
+                let is i64 as idx = lens[g * 258 + si] + 1;
+                base[g * 25 + idx] = base[g * 25 + idx] + 1;
+                si = si + 1;
+            }
+            i = 1;
+            while (i < 25) { base[g * 25 + i] = base[g * 25 + i] + base[g * 25 + i - 1]; i = i + 1; }
+            i = 0;
+            while (i < 25) { limit[g * 25 + i] = 0; i = i + 1; }
+            let is i64 as vec with mut = 0;
+            L2 = minLen;
+            while (L2 <= maxLen) {
+                vec = vec + (base[g * 25 + L2 + 1] - base[g * 25 + L2]);
+                limit[g * 25 + L2] = vec - 1;
+                vec = vec << 1;
+                L2 = L2 + 1;
+            }
+            L2 = minLen + 1;
+            while (L2 <= maxLen) {
+                base[g * 25 + L2] = ((limit[g * 25 + L2 - 1] + 1) << 1) - base[g * 25 + L2];
+                L2 = L2 + 1;
+            }
+            minLens[g] = minLen;
+            g = g + 1;
+        }
+
+        // MTF + RUNA/RUNB decode -> BWT last column (bwt[]) + unzftab counts
+        i = 0;
+        while (i < 256) { unzftab[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < nInUse) { mtf[i] = symMap[i]; i = i + 1; }
+
+        let is i64 as nblock with mut = 0;
+        let is i64 as groupNo with mut = 0 - 1;
+        let is i64 as groupPos with mut = 0;
+        let is i64 as curGroup with mut = 0;
+        let is i64 as runLen with mut = 0;
+        let is i64 as runBit with mut = 0;
+
+        while (1 == 1) {
+            if (groupPos == 0) {
+                groupNo = groupNo + 1;
+                groupPos = 50;
+                curGroup = selectors[groupNo];
+            }
+            groupPos = groupPos - 1;
+
+            // decode one symbol with curGroup's table
+            let is i64 as zn with mut = minLens[curGroup];
+            let is i64 as zvec with mut = _bits(&b, zn);
+            while (zvec > limit[curGroup * 25 + zn]) {
+                zn = zn + 1;
+                zvec = (zvec << 1) | _bit(&b);
+            }
+            let is i64 as sym = perm[curGroup * 258 + (zvec - base[curGroup * 25 + zn])];
+
+            if (sym <= 1) {
+                // RUNA (0) / RUNB (1): accumulate bijective run length
+                if (sym == 0) { runLen = runLen + (1 << runBit); }
+                else { runLen = runLen + (2 << runBit); }
+                runBit = runBit + 1;
+            } else {
+                // flush a pending run of the front MTF byte
+                if (runLen > 0) {
+                    let is i64 as fb = mtf[0];
+                    unzftab[fb] = unzftab[fb] + runLen;
+                    let is i64 as r with mut = 0;
+                    while (r < runLen) {
+                        if (nblock >= maxBlock) { return errno.Z_BADLEN; }
+                        bwt[nblock] = fb;
+                        nblock = nblock + 1;
+                        r = r + 1;
+                    }
+                    runLen = 0;
+                    runBit = 0;
+                }
+                if (sym == EOB) { break; }
+                // MTF index = sym - 1
+                let is i64 as jx = sym - 1;
+                let is i64 as bb = mtf[jx];
+                let is i64 as k with mut = jx;
+                while (k > 0) { mtf[k] = mtf[k - 1]; k = k - 1; }
+                mtf[0] = bb;
+                unzftab[bb] = unzftab[bb] + 1;
+                if (nblock >= maxBlock) { return errno.Z_BADLEN; }
+                bwt[nblock] = bb;
+                nblock = nblock + 1;
+            }
+        }
+
+        // inverse BWT: build the T (next) vector via cumulative counts
+        cftab[0] = 0;
+        i = 1;
+        while (i <= 256) { cftab[i] = unzftab[i - 1]; i = i + 1; }
+        i = 1;
+        while (i <= 256) { cftab[i] = cftab[i] + cftab[i - 1]; i = i + 1; }
+        i = 0;
+        while (i < nblock) {
+            let is i64 as c = bwt[i];
+            tt[cftab[c]] = i;
+            cftab[c] = cftab[c] + 1;
+            i = i + 1;
+        }
+
+        // follow the chain from origPtr, RLE1-decoding the byte stream
+        let is i64 as tPos with mut = tt[origPtr];
+        let is i64 as prev with mut = 0 - 1;
+        let is i64 as rl with mut = 0;
+        i = 0;
+        while (i < nblock) {
+            let is i64 as by = bwt[tPos];
+            tPos = tt[tPos];
+            i = i + 1;
+            if (rl == 4) {
+                // `by` is the count of additional repeats of `prev`
+                let is i64 as r with mut = 0;
+                while (r < by) {
+                    if (bytes.bytes_push(out, cast(u8, prev)) < 0) { return errno.Z_OOM; }
+                    r = r + 1;
+                }
+                rl = 0;
+                prev = 0 - 1;
+            } else {
+                if (bytes.bytes_push(out, cast(u8, by)) < 0) { return errno.Z_OOM; }
+                if (by == prev) { rl = rl + 1; }
+                else { prev = by; rl = 1; }
+            }
+        }
+    }
+    return out.len;
+}
