@@ -1,0 +1,611 @@
+// =======================================================
+// caustic-compact/formats/zstd.cst
+// Zstandard decompression (RFC 8878). Frame header -> blocks (raw/RLE/
+// compressed). A compressed block = a literals section (raw/RLE/Huffman,
+// 1 or 4 reverse bitstreams) + a sequences section (3 interleaved FSE
+// states for literal-length / offset / match-length, with repeat-offset
+// history). Dictionaries and checksum verification are not supported.
+// Faithful port of the zstd educational decoder.
+//   zstd_decompress(src, src_len, out) -> bytes written, or negative error.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "std/mem.cst" only bins, core as mem;
+
+// ---- forward (LSB-first) input stream ---------------------------------
+struct IStr { base as *u8; off as i64; len as i64; bit as i64; }
+
+// Read `n` bits LSB-first starting at absolute bit position `startBit` of p.
+fn _rdLE(p as *u8, startBit as i64, n as i64) as i64 {
+    let is i64 as bytepos with mut = startBit >> 3;
+    let is i64 as bitoff with mut = startBit & 7;
+    let is i64 as res with mut = 0;
+    let is i64 as shift with mut = 0;
+    let is i64 as left with mut = n;
+    while (left > 0) {
+        let is i64 as mask with mut = 0xFF;
+        if (left < 8) { mask = (1 << left) - 1; }
+        let is i64 as byte = cast(i64, p[bytepos]);
+        res = res | (((byte >> bitoff) & mask) << shift);
+        shift = shift + (8 - bitoff);
+        left = left - (8 - bitoff);
+        bytepos = bytepos + 1;
+        bitoff = 0;
+    }
+    return res;
+}
+
+fn _iread(s as *IStr, n as i64) as i64 {
+    let is i64 as full = (n + s.bit) / 8;
+    let is i64 as res = _rdLE(s.base, s.off * 8 + s.bit, n);
+    s.bit = (n + s.bit) % 8;
+    s.off = s.off + full;
+    s.len = s.len - full;
+    return res;
+}
+
+fn _irewind1(s as *IStr) as void {
+    let is i64 as no = s.bit - 1;
+    let is i64 as bytes_back = (0 - (no - 7)) / 8;
+    s.off = s.off - bytes_back;
+    s.len = s.len + bytes_back;
+    s.bit = ((no % 8) + 8) % 8;
+}
+
+fn _ialign(s as *IStr) as void {
+    if (s.bit != 0) { s.off = s.off + 1; s.len = s.len - 1; s.bit = 0; }
+}
+
+// ---- backward bit reader (HUF/FSE streams read from the end) ----------
+fn _streamBits(p as *u8, bits as i64, offp as *i64) as i64 {
+    offp[0] = offp[0] - bits;
+    let is i64 as aoff with mut = offp[0];
+    let is i64 as abits with mut = bits;
+    if (offp[0] < 0) { abits = abits + offp[0]; aoff = 0; }
+    let is i64 as res with mut = 0;
+    if (abits > 0) { res = _rdLE(p, aoff, abits); }
+    if (offp[0] < 0) {
+        let is i64 as sh = 0 - offp[0];
+        if (sh >= 63) { res = 0; } else { res = res << sh; }
+    }
+    return res;
+}
+
+fn _highbit(num as i64) as i64 {
+    let is i64 as i with mut = 62;
+    while (i >= 0) {
+        if ((1 << i) <= num) { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// ---- FSE / HUF tables (module-level; one decode at a time) -------------
+struct Fse { sym as *i64; nb as *i64; ns as *i64; accLog as i64; ok as i64; }
+struct Huf { sym as *i64; nb as *i64; maxBits as i64; ok as i64; }
+
+let is Fse as _llT with mut;
+let is Fse as _ofT with mut;
+let is Fse as _mlT with mut;
+let is Huf as _litT with mut;
+let is i64 as _o0 with mut;
+let is i64 as _o1 with mut;
+let is i64 as _o2 with mut;
+
+let is i32 as _alloc_ok with mut = 0;
+let is *i64 as _freqs with mut;
+let is *i64 as _weights with mut;
+let is *i64 as _hbits with mut;
+fn _ialloc(n as i64) as *i64 { return cast(*i64, mem.core.mmap_anon(n * 8)); }
+
+fn _zalloc() as void {
+    if (_alloc_ok == 1) { return; }
+    _llT.sym = _ialloc(512); _llT.nb = _ialloc(512); _llT.ns = _ialloc(512); _llT.ok = 0;
+    _ofT.sym = _ialloc(512); _ofT.nb = _ialloc(512); _ofT.ns = _ialloc(512); _ofT.ok = 0;
+    _mlT.sym = _ialloc(512); _mlT.nb = _ialloc(512); _mlT.ns = _ialloc(512); _mlT.ok = 0;
+    _litT.sym = _ialloc(2048); _litT.nb = _ialloc(2048); _litT.ok = 0;
+    _freqs = _ialloc(256); _weights = _ialloc(264); _hbits = _ialloc(264);
+    _alloc_ok = 1;
+}
+
+// ---- constant tables --------------------------------------------------
+let is *i64 as LLB with mut; let is *i64 as LLE with mut;
+let is *i64 as MLB with mut; let is *i64 as MLE with mut;
+let is *i64 as LLD with mut; let is *i64 as OFD with mut; let is *i64 as MLD with mut;
+let is i32 as _tab_ok with mut = 0;
+
+fn _seti(p as *i64, idx as i64, v as i64) as void { p[idx] = v; }
+
+fn _tabs() as void {
+    if (_tab_ok == 1) { return; }
+    LLB = _ialloc(36); LLE = _ialloc(36); MLB = _ialloc(53); MLE = _ialloc(53);
+    LLD = _ialloc(36); OFD = _ialloc(29); MLD = _ialloc(53);
+
+    // LL baselines
+    let is i64 as i with mut = 0;
+    while (i < 16) { LLB[i] = i; i = i + 1; }
+    LLB[16]=16; LLB[17]=18; LLB[18]=20; LLB[19]=22; LLB[20]=24; LLB[21]=28;
+    LLB[22]=32; LLB[23]=40; LLB[24]=48; LLB[25]=64; LLB[26]=128; LLB[27]=256;
+    LLB[28]=512; LLB[29]=1024; LLB[30]=2048; LLB[31]=4096; LLB[32]=8192;
+    LLB[33]=16384; LLB[34]=32768; LLB[35]=65536;
+    i = 0; while (i < 16) { LLE[i] = 0; i = i + 1; }
+    LLE[16]=1; LLE[17]=1; LLE[18]=1; LLE[19]=1; LLE[20]=2; LLE[21]=2; LLE[22]=3;
+    LLE[23]=3; LLE[24]=4; LLE[25]=6; LLE[26]=7; LLE[27]=8; LLE[28]=9; LLE[29]=10;
+    LLE[30]=11; LLE[31]=12; LLE[32]=13; LLE[33]=14; LLE[34]=15; LLE[35]=16;
+
+    // ML baselines
+    i = 0; while (i < 32) { MLB[i] = i + 3; i = i + 1; }
+    MLB[32]=35; MLB[33]=37; MLB[34]=39; MLB[35]=41; MLB[36]=43; MLB[37]=47;
+    MLB[38]=51; MLB[39]=59; MLB[40]=67; MLB[41]=83; MLB[42]=99; MLB[43]=131;
+    MLB[44]=259; MLB[45]=515; MLB[46]=1027; MLB[47]=2051; MLB[48]=4099;
+    MLB[49]=8195; MLB[50]=16387; MLB[51]=32771; MLB[52]=65539;
+    i = 0; while (i < 32) { MLE[i] = 0; i = i + 1; }
+    MLE[32]=1; MLE[33]=1; MLE[34]=1; MLE[35]=1; MLE[36]=2; MLE[37]=2; MLE[38]=3;
+    MLE[39]=3; MLE[40]=4; MLE[41]=4; MLE[42]=5; MLE[43]=7; MLE[44]=8; MLE[45]=9;
+    MLE[46]=10; MLE[47]=11; MLE[48]=12; MLE[49]=13; MLE[50]=14; MLE[51]=15; MLE[52]=16;
+
+    // default distributions (negative = "less than 1")
+    LLD[0]=4; LLD[1]=3; i = 2; while (i < 13) { LLD[i]=2; i=i+1; }
+    LLD[13]=1; LLD[14]=1; LLD[15]=1; i = 16; while (i < 25) { LLD[i]=2; i=i+1; }
+    LLD[25]=3; LLD[26]=2; LLD[27]=1; LLD[28]=1; LLD[29]=1; LLD[30]=1; LLD[31]=1;
+    LLD[32]=0-1; LLD[33]=0-1; LLD[34]=0-1; LLD[35]=0-1;
+
+    OFD[0]=1; OFD[1]=1; OFD[2]=1; OFD[3]=1; OFD[4]=1; OFD[5]=1; OFD[6]=2; OFD[7]=2;
+    OFD[8]=2; i = 9; while (i < 24) { OFD[i]=1; i=i+1; }
+    OFD[24]=0-1; OFD[25]=0-1; OFD[26]=0-1; OFD[27]=0-1; OFD[28]=0-1;
+
+    MLD[0]=1; MLD[1]=4; MLD[2]=3; i = 3; while (i < 9) { MLD[i]=2; i=i+1; }
+    i = 9; while (i < 46) { MLD[i]=1; i=i+1; }
+    MLD[46]=0-1; MLD[47]=0-1; MLD[48]=0-1; MLD[49]=0-1; MLD[50]=0-1; MLD[51]=0-1; MLD[52]=0-1;
+    _tab_ok = 1;
+}
+
+// ---- FSE ---------------------------------------------------------------
+fn _fse_build(t as *Fse, freqs as *i64, numSymbs as i64, accLog as i64) as void {
+    t.accLog = accLog;
+    let is i64 as size = 1 << accLog;
+    let is i64 as high with mut = size;
+    let is [256]i64 as desc;
+    let is i64 as s with mut = 0;
+    while (s < numSymbs) {
+        if (freqs[s] == (0 - 1)) {
+            high = high - 1;
+            t.sym[high] = s;
+            desc[s] = 1;
+        }
+        s = s + 1;
+    }
+    let is i64 as step = (size >> 1) + (size >> 3) + 3;
+    let is i64 as mask = size - 1;
+    let is i64 as pos with mut = 0;
+    s = 0;
+    while (s < numSymbs) {
+        if (freqs[s] > 0) {
+            desc[s] = freqs[s];
+            let is i64 as i with mut = 0;
+            while (i < freqs[s]) {
+                t.sym[pos] = s;
+                pos = (pos + step) & mask;
+                while (pos >= high) { pos = (pos + step) & mask; }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+    let is i64 as u with mut = 0;
+    while (u < size) {
+        let is i64 as symbol = t.sym[u];
+        let is i64 as nsd = desc[symbol];
+        desc[symbol] = nsd + 1;
+        let is i64 as nb = accLog - _highbit(nsd);
+        t.nb[u] = nb;
+        t.ns[u] = (nsd << nb) - size;
+        u = u + 1;
+    }
+    t.ok = 1;
+}
+
+// Decode an FSE table description from a forward stream into t.
+fn _fse_header(t as *Fse, s as *IStr) as void {
+    let is i64 as accLog = 5 + _iread(s, 4);
+    let is i64 as remaining with mut = 1 << accLog;
+    let is i64 as symb with mut = 0;
+    while (remaining > 0) {
+        if (symb >= 256) { break; }
+        let is i64 as bits = _highbit(remaining + 1) + 1;
+        let is i64 as val with mut = _iread(s, bits);
+        let is i64 as lowMask = (1 << (bits - 1)) - 1;
+        let is i64 as threshold = ((1 << bits) - 1) - (remaining + 1);
+        if ((val & lowMask) < threshold) {
+            _irewind1(s);
+            val = val & lowMask;
+        } else if (val > lowMask) {
+            val = val - threshold;
+        }
+        let is i64 as proba = val - 1;
+        if (proba < 0) { remaining = remaining - (0 - proba); }
+        else { remaining = remaining - proba; }
+        _freqs[symb] = proba;
+        symb = symb + 1;
+        if (proba == 0) {
+            let is i64 as repeat with mut = _iread(s, 2);
+            while (1 == 1) {
+                let is i64 as k with mut = 0;
+                while (k < repeat) {
+                    if (symb < 256) { _freqs[symb] = 0; symb = symb + 1; }
+                    k = k + 1;
+                }
+                if (repeat == 3) { repeat = _iread(s, 2); } else { break; }
+            }
+        }
+    }
+    _ialign(s);
+    _fse_build(t, _freqs, symb, accLog);
+}
+
+fn _fse_rle(t as *Fse, symb as i64) as void {
+    t.sym[0] = symb; t.nb[0] = 0; t.ns[0] = 0; t.accLog = 0; t.ok = 1;
+}
+
+// ---- HUF ---------------------------------------------------------------
+fn _huf_build(t as *Huf, bits as *i64, numSymbs as i64) as void {
+    let is i64 as maxBits with mut = 0;
+    let is [16]i64 as rankCount;
+    let is i64 as i with mut = 0;
+    while (i < 16) { rankCount[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < numSymbs) {
+        if (bits[i] > maxBits) { maxBits = bits[i]; }
+        rankCount[bits[i]] = rankCount[bits[i]] + 1;
+        i = i + 1;
+    }
+    t.maxBits = maxBits;
+    let is i64 as tableSize = 1 << maxBits;
+    let is [16]i64 as rankIdx;
+    rankIdx[maxBits] = 0;
+    i = maxBits;
+    while (i >= 1) {
+        rankIdx[i - 1] = rankIdx[i] + rankCount[i] * (1 << (maxBits - i));
+        let is i64 as j with mut = rankIdx[i];
+        while (j < rankIdx[i - 1]) { t.nb[j] = i; j = j + 1; }
+        i = i - 1;
+    }
+    i = 0;
+    while (i < numSymbs) {
+        if (bits[i] != 0) {
+            let is i64 as code = rankIdx[bits[i]];
+            let is i64 as ln = 1 << (maxBits - bits[i]);
+            let is i64 as j with mut = 0;
+            while (j < ln) { t.sym[code + j] = i; j = j + 1; }
+            rankIdx[bits[i]] = code + ln;
+        }
+        i = i + 1;
+    }
+    t.ok = 1;
+}
+
+fn _huf_weights(t as *Huf, weights as *i64, numSymbs as i64) as void {
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < numSymbs) {
+        if (weights[i] > 0) { sum = sum + (1 << (weights[i] - 1)); }
+        i = i + 1;
+    }
+    let is i64 as maxBits = _highbit(sum) + 1;
+    let is i64 as leftOver = (1 << maxBits) - sum;
+    let is i64 as lastWeight = _highbit(leftOver) + 1;
+    i = 0;
+    while (i < numSymbs) {
+        if (weights[i] > 0) { _hbits[i] = maxBits + 1 - weights[i]; }
+        else { _hbits[i] = 0; }
+        i = i + 1;
+    }
+    _hbits[numSymbs] = maxBits + 1 - lastWeight;
+    _huf_build(t, _hbits, numSymbs + 1);
+}
+
+// Decode the Huffman table description (header byte + weights).
+fn _huf_table(t as *Huf, s as *IStr) as void {
+    let is i64 as header = _iread(s, 8);
+    let is i64 as numSymbs with mut = 0;
+    if (header >= 128) {
+        numSymbs = header - 127;
+        let is i64 as i with mut = 0;
+        while (i < numSymbs) {
+            let is i64 as byteoff = s.off + (i / 2);
+            let is i64 as bv = cast(i64, s.base[byteoff]);
+            if ((i % 2) == 0) { _weights[i] = bv >> 4; }
+            else { _weights[i] = bv & 0xF; }
+            i = i + 1;
+        }
+        let is i64 as nbytes = (numSymbs + 1) / 2;
+        s.off = s.off + nbytes; s.len = s.len - nbytes;
+    } else {
+        // FSE-compressed weights
+        let is i64 as fseStart = s.off;
+        let is IStr as fs;
+        fs.base = s.base; fs.off = fseStart; fs.len = header; fs.bit = 0;
+        s.off = s.off + header; s.len = s.len - header;
+        let is Fse as wt;
+        wt.sym = _ialloc(128); wt.nb = _ialloc(128); wt.ns = _ialloc(128);
+        _fse_header(&wt, &fs);
+        // interleaved-2 FSE decode of the weight stream into _weights
+        numSymbs = _fse_decompress2(&wt, &fs, _weights);
+    }
+    _huf_weights(t, _weights, numSymbs);
+}
+
+// FSE interleaved-2 decode: returns number of symbols written to dst.
+fn _fse_decompress2(t as *Fse, s as *IStr, dst as *i64) as i64 {
+    let is i64 as len = s.len;
+    let is *u8 as src = cast(*u8, cast(i64, s.base) + s.off);
+    let is i64 as pad = 8 - _highbit(cast(i64, src[len - 1]));
+    let is i64 as off with mut = len * 8 - pad;
+    let is i64 as st1 with mut = _streamBits(src, t.accLog, &off);
+    let is i64 as st2 with mut = _streamBits(src, t.accLog, &off);
+    let is i64 as count with mut = 0;
+    while (1 == 1) {
+        dst[count] = t.sym[st1]; count = count + 1;
+        st1 = t.ns[st1] + _streamBits(src, t.nb[st1], &off);
+        if (off < 0) { dst[count] = t.sym[st2]; count = count + 1; break; }
+        dst[count] = t.sym[st2]; count = count + 1;
+        st2 = t.ns[st2] + _streamBits(src, t.nb[st2], &off);
+        if (off < 0) { dst[count] = t.sym[st1]; count = count + 1; break; }
+    }
+    return count;
+}
+
+// ---- literals ----------------------------------------------------------
+// HUF decode one reverse stream of `len` bytes at s.off into lit[*litpos..].
+fn _huf_1stream(t as *Huf, s as *IStr, len as i64, lit as *u8, litpos as *i64) as void {
+    let is *u8 as src = cast(*u8, cast(i64, s.base) + s.off);
+    let is i64 as pad = 8 - _highbit(cast(i64, src[len - 1]));
+    let is i64 as off with mut = len * 8 - pad;
+    let is i64 as state with mut = _streamBits(src, t.maxBits, &off);
+    let is i64 as mask = (1 << t.maxBits) - 1;
+    while (off > (0 - t.maxBits)) {
+        let is i64 as symb = t.sym[state];
+        let is i64 as nb = t.nb[state];
+        let is i64 as rest = _streamBits(src, nb, &off);
+        state = ((state << nb) + rest) & mask;
+        lit[litpos[0]] = cast(u8, symb);
+        litpos[0] = litpos[0] + 1;
+    }
+}
+
+// Decode the literals section; returns size, writes pointer into *litOut.
+fn _decode_literals(s as *IStr, litOut as *i64, sizeOut as *i64) as i64 {
+    let is i64 as blockType = _iread(s, 2);
+    let is i64 as sizeFormat = _iread(s, 2);
+    let is i64 as regSize with mut = 0;
+
+    if (blockType <= 1) {
+        if (sizeFormat == 0 || sizeFormat == 2) { _irewind1(s); regSize = _iread(s, 5); }
+        else if (sizeFormat == 1) { regSize = _iread(s, 12); }
+        else { regSize = _iread(s, 20); }
+        let is *u8 as buf = mem.core.mmap_anon(regSize + 8);
+        if (blockType == 0) {
+            mem.core.memcpy(buf, cast(*u8, cast(i64, s.base) + s.off), regSize);
+            s.off = s.off + regSize; s.len = s.len - regSize;
+        } else {
+            let is i64 as rb = cast(i64, s.base[s.off]);
+            s.off = s.off + 1; s.len = s.len - 1;
+            mem.core.memset(buf, cast(i32, rb), regSize);
+        }
+        litOut[0] = cast(i64, buf);
+        sizeOut[0] = regSize;
+        return 0;
+    }
+
+    // Huffman-compressed literals
+    let is i64 as numStreams with mut = 4;
+    let is i64 as compSize with mut = 0;
+    if (sizeFormat == 0) { numStreams = 1; regSize = _iread(s, 10); compSize = _iread(s, 10); }
+    else if (sizeFormat == 1) { regSize = _iread(s, 10); compSize = _iread(s, 10); }
+    else if (sizeFormat == 2) { regSize = _iread(s, 14); compSize = _iread(s, 14); }
+    else { regSize = _iread(s, 18); compSize = _iread(s, 18); }
+
+    let is *u8 as buf = mem.core.mmap_anon(regSize + 8);
+    // the Huffman stream sub-region occupies compSize bytes from s.off
+    let is IStr as hs;
+    hs.base = s.base; hs.off = s.off; hs.len = compSize; hs.bit = 0;
+    let is i64 as afterComp = s.off + compSize;
+    let is i64 as afterLen = s.len - compSize;
+
+    if (blockType == 2) { _huf_table(&_litT, &hs); }
+    else { if (_litT.ok == 0) { return errno.Z_BADHDR; } }
+
+    let is i64 as litpos with mut = 0;
+    if (numStreams == 1) {
+        _huf_1stream(&_litT, &hs, hs.len, buf, &litpos);
+    } else {
+        let is i64 as c1 = _iread(&hs, 16);
+        let is i64 as c2 = _iread(&hs, 16);
+        let is i64 as c3 = _iread(&hs, 16);
+        // hs is byte-aligned after the 6-byte jump table
+        let is i64 as base0 = hs.off;
+        let is IStr as q;
+        q.base = hs.base; q.bit = 0;
+        q.off = base0;          _huf_1stream(&_litT, &q, c1, buf, &litpos);
+        q.off = base0 + c1;     _huf_1stream(&_litT, &q, c2, buf, &litpos);
+        q.off = base0 + c1 + c2; _huf_1stream(&_litT, &q, c3, buf, &litpos);
+        let is i64 as c4 = hs.len - c1 - c2 - c3;   // hs.len already excludes the 6 jump-table bytes
+        q.off = base0 + c1 + c2 + c3; _huf_1stream(&_litT, &q, c4, buf, &litpos);
+    }
+    s.off = afterComp; s.len = afterLen;
+    litOut[0] = cast(i64, buf);
+    sizeOut[0] = regSize;
+    return 0;
+}
+
+// ---- sequences ---------------------------------------------------------
+fn _seq_table(t as *Fse, s as *IStr, deflt as *i64, defLen as i64, defAcc as i64, mode as i64) as i64 {
+    if (mode == 0) { _fse_build(t, deflt, defLen, defAcc); }
+    else if (mode == 1) { let is i64 as sb = cast(i64, s.base[s.off]); s.off = s.off + 1; s.len = s.len - 1; _fse_rle(t, sb); }
+    else if (mode == 2) { _fse_header(t, s); }
+    else { if (t.ok == 0) { return errno.Z_BADHDR; } }
+    return 0;
+}
+
+// ---- top-level block / frame ------------------------------------------
+fn _match_copy(out as *bytes.Bytes, offset as i64, mlen as i64) as i64 {
+    if (offset > out.len) { return errno.Z_BADDIST; }
+    if (bytes.bytes_reserve(out, mlen) < 0) { return errno.Z_OOM; }
+    let is i64 as sp with mut = out.len - offset;
+    let is i64 as dp with mut = out.len;
+    let is i64 as e = out.len + mlen;
+    while (dp < e) { out.ptr[dp] = out.ptr[sp]; sp = sp + 1; dp = dp + 1; }
+    out.len = e;
+    return 0;
+}
+
+fn _compute_offset(rawoff as i64, litlen as i64) as i64 {
+    if (rawoff > 3) {
+        let is i64 as offset = rawoff - 3;
+        _o2 = _o1; _o1 = _o0; _o0 = offset;
+        return offset;
+    }
+    let is i64 as idx with mut = rawoff - 1;
+    if (litlen == 0) { idx = idx + 1; }
+    if (idx == 0) { return _o0; }
+    let is i64 as offset with mut = 0;
+    if (idx == 1) { offset = _o1; }
+    else if (idx == 2) { offset = _o2; }
+    else { offset = _o0 - 1; }
+    if (idx > 1) { _o2 = _o1; }
+    _o1 = _o0;
+    _o0 = offset;
+    return offset;
+}
+
+fn _decompress_block(s as *IStr, blockLen as i64, out as *bytes.Bytes) as i64 {
+    let is i64 as litPtr with mut = 0;
+    let is i64 as litSize with mut = 0;
+    let is i64 as blockEnd = s.off + blockLen;
+    let is i64 as lr = _decode_literals(s, &litPtr, &litSize);
+    if (lr < 0) { return lr; }
+    let is *u8 as lit = cast(*u8, litPtr);
+
+    // number of sequences
+    let is i64 as nseq with mut = _iread(s, 8);
+    if (nseq == 0) {
+        // no sequences: the literals are the whole block output
+        if (bytes.bytes_append(out, lit, litSize) < 0) { return errno.Z_OOM; }
+        s.off = blockEnd;
+        return 0;
+    }
+    if (nseq >= 128) {
+        if (nseq < 255) { nseq = ((nseq - 128) << 8) + _iread(s, 8); }
+        else { nseq = _iread(s, 16) + 0x7F00; }
+    }
+
+    let is i64 as modes = _iread(s, 8);
+    if (_seq_table(&_llT, s, LLD, 36, 6, (modes >> 6) & 3) < 0) { return errno.Z_BADHDR; }
+    if (_seq_table(&_ofT, s, OFD, 29, 5, (modes >> 4) & 3) < 0) { return errno.Z_BADHDR; }
+    if (_seq_table(&_mlT, s, MLD, 53, 6, (modes >> 2) & 3) < 0) { return errno.Z_BADHDR; }
+
+    // the FSE sequence bitstream runs to the end of the block (read backward)
+    let is *u8 as bsrc = cast(*u8, cast(i64, s.base) + s.off);
+    let is i64 as bsLen = blockEnd - s.off;
+    let is i64 as pad = 8 - _highbit(cast(i64, bsrc[bsLen - 1]));
+    let is i64 as off with mut = bsLen * 8 - pad;
+
+    let is i64 as llSt with mut = _streamBits(bsrc, _llT.accLog, &off);
+    let is i64 as ofSt with mut = _streamBits(bsrc, _ofT.accLog, &off);
+    let is i64 as mlSt with mut = _streamBits(bsrc, _mlT.accLog, &off);
+
+    let is i64 as litCursor with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nseq) {
+        let is i64 as ofCode = _ofT.sym[ofSt];
+        let is i64 as llCode = _llT.sym[llSt];
+        let is i64 as mlCode = _mlT.sym[mlSt];
+
+        let is i64 as rawoff = (1 << ofCode) + _streamBits(bsrc, ofCode, &off);
+        let is i64 as mlen = MLB[mlCode] + _streamBits(bsrc, MLE[mlCode], &off);
+        let is i64 as llen = LLB[llCode] + _streamBits(bsrc, LLE[llCode], &off);
+
+        let is i64 as last with mut = 0;
+        if (i == nseq - 1) { last = 1; }
+        if (last == 0) {
+            llSt = _llT.ns[llSt] + _streamBits(bsrc, _llT.nb[llSt], &off);
+            mlSt = _mlT.ns[mlSt] + _streamBits(bsrc, _mlT.nb[mlSt], &off);
+            ofSt = _ofT.ns[ofSt] + _streamBits(bsrc, _ofT.nb[ofSt], &off);
+        }
+
+        // emit literals
+        if (llen > 0) {
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, lit) + litCursor), llen) < 0) { return errno.Z_OOM; }
+            litCursor = litCursor + llen;
+        }
+        // emit match
+        let is i64 as offset = _compute_offset(rawoff, llen);
+        let is i64 as mc = _match_copy(out, offset, mlen);
+        if (mc < 0) { return mc; }
+        i = i + 1;
+    }
+
+    // trailing literals
+    if (litCursor < litSize) {
+        if (bytes.bytes_append(out, cast(*u8, cast(i64, lit) + litCursor), litSize - litCursor) < 0) { return errno.Z_OOM; }
+    }
+    s.off = blockEnd;
+    return 0;
+}
+
+fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    _zalloc();
+    _tabs();
+    if (src_len < 5) { return errno.Z_BADHDR; }
+    if (cast(i64, src[0]) != 0x28) { return errno.Z_BADHDR; }
+    if (cast(i64, src[1]) != 0xB5) { return errno.Z_BADHDR; }
+    if (cast(i64, src[2]) != 0x2F) { return errno.Z_BADHDR; }
+    if (cast(i64, src[3]) != 0xFD) { return errno.Z_BADHDR; }
+
+    let is IStr as s;
+    s.base = src; s.off = 4; s.len = src_len - 4; s.bit = 0;
+
+    let is i64 as desc = _iread(&s, 8);
+    let is i64 as fcsFlag = desc >> 6;
+    let is i64 as singleSeg = (desc >> 5) & 1;
+    let is i64 as checksumFlag = (desc >> 2) & 1;
+    let is i64 as dictFlag = desc & 3;
+
+    if (singleSeg == 0) { _iread(&s, 8); }                     // window descriptor
+    if (dictFlag == 1) { _iread(&s, 8); }
+    else if (dictFlag == 2) { _iread(&s, 16); }
+    else if (dictFlag == 3) { _iread(&s, 32); }
+    if (singleSeg == 1 || fcsFlag != 0) {
+        let is i64 as fb with mut = 1;
+        if (fcsFlag == 1) { fb = 2; } else if (fcsFlag == 2) { fb = 4; } else if (fcsFlag == 3) { fb = 8; }
+        _iread(&s, fb * 8);                                    // frame content size (ignored)
+    }
+
+    // reset repeat-offset history and entropy-table validity
+    _o0 = 1; _o1 = 4; _o2 = 8;
+    _llT.ok = 0; _ofT.ok = 0; _mlT.ok = 0; _litT.ok = 0;
+
+    let is i64 as last with mut = 0;
+    while (last == 0) {
+        last = _iread(&s, 1);
+        let is i64 as btype = _iread(&s, 2);
+        let is i64 as blen = _iread(&s, 21);
+        if (btype == 0) {
+            if (bytes.bytes_append(out, cast(*u8, cast(i64, s.base) + s.off), blen) < 0) { return errno.Z_OOM; }
+            s.off = s.off + blen; s.len = s.len - blen;
+        } else if (btype == 1) {
+            let is i64 as rb = cast(i64, s.base[s.off]);
+            s.off = s.off + 1; s.len = s.len - 1;
+            let is i64 as j with mut = 0;
+            while (j < blen) { if (bytes.bytes_push(out, cast(u8, rb)) < 0) { return errno.Z_OOM; } j = j + 1; }
+        } else if (btype == 2) {
+            let is i64 as r = _decompress_block(&s, blen, out);
+            if (r < 0) { return r; }
+            s.len = src_len - s.off;
+        } else {
+            return errno.Z_BADTYPE;
+        }
+    }
+    return out.len;
+}

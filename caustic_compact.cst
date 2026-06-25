@@ -27,3 +27,4 @@ use "formats/lzma.cst"    as lzma;
 use "formats/lzma2.cst"   as lzma2;
 use "formats/xz.cst"      as xz;
 use "formats/bzip2.cst"   as bzip2;
+use "formats/zstd.cst"    as zstd;
