@@ -270,6 +270,49 @@ fn suite_zstd() as i64 {
     return b;
 }
 
+// encode dispatch (kinds match _decode)
+fn _encode(kind as i64, src as *u8, slen as i64, out as *bytes.Bytes) as i64 {
+    if (kind == 3) { return lz4.lz4_compress(src, slen, out, 1); }
+    if (kind == 4) { return snappy.snappy_compress(src, slen, out, 1); }
+    return 0 - 1;
+}
+
+// compress a fixture then decompress it and compare to the original
+fn enc_rt(kind as i64, name as *u8, bin_path as *u8) as i64 {
+    io.write_str(io.STDOUT, "  ");
+    io.write_str(io.STDOUT, name);
+    let is i64 as slen with mut = 0;
+    let is *u8 as src = read_whole(bin_path, &slen);
+    if (cast(i64, src) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is bytes.Bytes as comp = bytes.bytes_new(256);
+    if (_encode(kind, src, slen, &comp) < 0) { bytes.bytes_free(&comp); io.write_str(io.STDOUT, " ... FAIL (enc)\n"); return 1; }
+    let is bytes.Bytes as dec = bytes.bytes_new(256);
+    let is i64 as r = _decode(kind, comp.ptr, comp.len, &dec);
+    let is i64 as ok with mut = 0;
+    if (r >= 0) { ok = _same(&dec, src, slen); }
+    bytes.bytes_free(&comp);
+    bytes.bytes_free(&dec);
+    if (ok == 1) { io.write_str(io.STDOUT, " ... PASS\n"); return 0; }
+    io.write_str(io.STDOUT, " ... FAIL\n");
+    return 1;
+}
+
+fn suite_encode_modern() as i64 {
+    io.write_str(io.STDOUT, "[encode roundtrip: lz4/snappy]\n");
+    let is i64 as b with mut = 0;
+    b = b + enc_rt(3, "lz4:empty",  "tests/fixtures/empty.bin");
+    b = b + enc_rt(3, "lz4:hello",  "tests/fixtures/hello.bin");
+    b = b + enc_rt(3, "lz4:lorem",  "tests/fixtures/lorem.bin");
+    b = b + enc_rt(3, "lz4:window", "tests/fixtures/window.bin");
+    b = b + enc_rt(3, "lz4:big",    "tests/fixtures/big.bin");
+    b = b + enc_rt(4, "sz:empty",   "tests/fixtures/empty.bin");
+    b = b + enc_rt(4, "sz:hello",   "tests/fixtures/hello.bin");
+    b = b + enc_rt(4, "sz:lorem",   "tests/fixtures/lorem.bin");
+    b = b + enc_rt(4, "sz:window",  "tests/fixtures/window.bin");
+    b = b + enc_rt(4, "sz:big",     "tests/fixtures/big.bin");
+    return b;
+}
+
 fn suite_brotli() as i64 {
     io.write_str(io.STDOUT, "[brotli]\n");
     let is i64 as b with mut = 0;
@@ -294,6 +337,7 @@ fn main() as i32 {
     bad = bad + suite_bzip2();
     bad = bad + suite_zstd();
     bad = bad + suite_brotli();
+    bad = bad + suite_encode_modern();
     if (bad == 0) {
         io.write_str(io.STDOUT, "\nall green\n");
     } else {

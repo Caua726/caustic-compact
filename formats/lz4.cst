@@ -10,6 +10,7 @@
 use "../core/errno.cst" as errno;
 use "../core/bytes.cst" as bytes;
 use "../core/checksum.cst" as checksum;
+use "std/mem.cst" only bins, core as mem;
 
 fn _le32(p as *u8, off as i64) as i64 {
     return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8)
@@ -114,5 +115,120 @@ fn lz4_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         let is i64 as stored = _le32(src, pos);
         if (checksum.xxhash32(out.ptr, out.len) != stored) { return errno.Z_BADSUM; }
     }
+    return out.len;
+}
+
+// ---- encode -----------------------------------------------------------
+fn _wr_len(out as *bytes.Bytes, n as i64) as void {
+    let is i64 as v with mut = n;
+    while (v >= 255) { bytes.bytes_push(out, cast(u8, 255)); v = v - 255; }
+    bytes.bytes_push(out, cast(u8, v));
+}
+
+fn _hash4(src as *u8, p as i64) as i64 {
+    let is i64 as v = cast(i64, src[p]) | (cast(i64, src[p + 1]) << 8)
+                    | (cast(i64, src[p + 2]) << 16) | (cast(i64, src[p + 3]) << 24);
+    return ((v * 2654435761) & 0xFFFFFFFF) >> 16;
+}
+
+// Compress src[0,len) as one LZ4 block appended to out (greedy hash matcher).
+fn _lz4_enc_block(src as *u8, len as i64, out as *bytes.Bytes) as i64 {
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(65536 * 8));
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), 65536 * 8);   // -1
+    let is i64 as anchor with mut = 0;
+    let is i64 as ip with mut = 0;
+    let is i64 as mflimit = len - 12;
+    let is i64 as matchlimit = len - 5;
+
+    if (len >= 13) {
+        ip = 1;
+        while (ip < mflimit) {
+            let is i64 as h = _hash4(src, ip);
+            let is i64 as cand = head[h];
+            head[h] = ip;
+            let is i64 as ok with mut = 0;
+            if (cand >= 0) {
+                if (ip - cand <= 65535) {
+                    if (src[cand] == src[ip] && src[cand + 1] == src[ip + 1]
+                        && src[cand + 2] == src[ip + 2] && src[cand + 3] == src[ip + 3]) { ok = 1; }
+                }
+            }
+            if (ok == 0) {
+                ip = ip + 1;
+            } else {
+                let is i64 as mlen with mut = 4;
+                while (ip + mlen < matchlimit) {
+                    if (src[cand + mlen] != src[ip + mlen]) { break; }
+                    mlen = mlen + 1;
+                }
+                let is i64 as litLen = ip - anchor;
+                let is i64 as mcode = mlen - 4;
+                let is i64 as t1 with mut = litLen;
+                if (t1 > 15) { t1 = 15; }
+                let is i64 as t2 with mut = mcode;
+                if (t2 > 15) { t2 = 15; }
+                bytes.bytes_push(out, cast(u8, (t1 << 4) | t2));
+                if (litLen >= 15) { _wr_len(out, litLen - 15); }
+                bytes.bytes_append(out, cast(*u8, cast(i64, src) + anchor), litLen);
+                let is i64 as offset = ip - cand;
+                bytes.bytes_push(out, cast(u8, offset & 0xFF));
+                bytes.bytes_push(out, cast(u8, (offset >> 8) & 0xFF));
+                if (mcode >= 15) { _wr_len(out, mcode - 15); }
+                ip = ip + mlen;
+                anchor = ip;
+            }
+        }
+    }
+    // last literals
+    let is i64 as litLen = len - anchor;
+    let is i64 as t with mut = litLen;
+    if (t > 15) { t = 15; }
+    bytes.bytes_push(out, cast(u8, t << 4));
+    if (litLen >= 15) { _wr_len(out, litLen - 15); }
+    bytes.bytes_append(out, cast(*u8, cast(i64, src) + anchor), litLen);
+    mem.core.munmap(cast(*u8, head), 65536 * 8);
+    return 0;
+}
+
+// Compress into an LZ4 frame (magic 04 22 4D 18, 4 MB blocks, no checksums).
+fn lz4_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    bytes.bytes_push(out, cast(u8, 0x04));
+    bytes.bytes_push(out, cast(u8, 0x22));
+    bytes.bytes_push(out, cast(u8, 0x4D));
+    bytes.bytes_push(out, cast(u8, 0x18));
+    let is [2]u8 as desc;
+    desc[0] = cast(u8, 0x60);   // FLG: version 01, block-independence
+    desc[1] = cast(u8, 0x70);   // BD: 4 MB max block size
+    bytes.bytes_push(out, desc[0]);
+    bytes.bytes_push(out, desc[1]);
+    let is i64 as hc = (checksum.xxhash32(cast(*u8, &desc), 2) >> 8) & 0xFF;
+    bytes.bytes_push(out, cast(u8, hc));
+
+    let is i64 as pos with mut = 0;
+    while (pos < src_len) {
+        let is i64 as chunk with mut = src_len - pos;
+        if (chunk > 4194304) { chunk = 4194304; }
+        let is bytes.Bytes as blk = bytes.bytes_new(256);
+        if (_lz4_enc_block(cast(*u8, cast(i64, src) + pos), chunk, &blk) < 0) { bytes.bytes_free(&blk); return errno.Z_OOM; }
+        if (blk.len >= chunk) {
+            // store uncompressed (high bit set)
+            let is i64 as bs = chunk | 0x80000000;
+            bytes.bytes_push(out, cast(u8, bs & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bs >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bs >> 16) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bs >> 24) & 0xFF));
+            bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), chunk);
+        } else {
+            bytes.bytes_push(out, cast(u8, blk.len & 0xFF));
+            bytes.bytes_push(out, cast(u8, (blk.len >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (blk.len >> 16) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (blk.len >> 24) & 0xFF));
+            bytes.bytes_append(out, blk.ptr, blk.len);
+        }
+        bytes.bytes_free(&blk);
+        pos = pos + chunk;
+    }
+    bytes.bytes_push(out, cast(u8, 0)); bytes.bytes_push(out, cast(u8, 0));
+    bytes.bytes_push(out, cast(u8, 0)); bytes.bytes_push(out, cast(u8, 0));   // EndMark
     return out.len;
 }

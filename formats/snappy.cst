@@ -9,6 +9,7 @@
 
 use "../core/errno.cst" as errno;
 use "../core/bytes.cst" as bytes;
+use "std/mem.cst" only bins, core as mem;
 
 fn _copy_back(out as *bytes.Bytes, offset as i64, length as i64) as i64 {
     if (offset > out.len) { return errno.Z_BADDIST; }
@@ -93,5 +94,104 @@ fn snappy_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
     }
 
     if (out.len != ulen) { return errno.Z_BADLEN; }
+    return out.len;
+}
+
+// ---- encode -----------------------------------------------------------
+fn _sn_hash(src as *u8, p as i64) as i64 {
+    let is i64 as v = cast(i64, src[p]) | (cast(i64, src[p + 1]) << 8)
+                    | (cast(i64, src[p + 2]) << 16) | (cast(i64, src[p + 3]) << 24);
+    return ((v * 2654435761) & 0xFFFFFFFF) >> 16;
+}
+
+fn _sn_lit(out as *bytes.Bytes, src as *u8, start as i64, length as i64) as void {
+    if (length == 0) { return; }
+    let is i64 as m = length - 1;
+    if (m < 60) {
+        bytes.bytes_push(out, cast(u8, m << 2));
+    } else {
+        let is i64 as nb with mut = 1;
+        if (m >= 256) { nb = 2; }
+        if (m >= 65536) { nb = 3; }
+        if (m >= 16777216) { nb = 4; }
+        bytes.bytes_push(out, cast(u8, (59 + nb) << 2));
+        let is i64 as i with mut = 0;
+        while (i < nb) { bytes.bytes_push(out, cast(u8, (m >> (8 * i)) & 0xFF)); i = i + 1; }
+    }
+    bytes.bytes_append(out, cast(*u8, cast(i64, src) + start), length);
+}
+
+fn _sn_copy(out as *bytes.Bytes, offset as i64, length as i64) as void {
+    let is i64 as len with mut = length;
+    while (len > 0) {
+        if (len >= 4 && len <= 11 && offset < 2048) {
+            bytes.bytes_push(out, cast(u8, ((offset >> 8) << 5) | ((len - 4) << 2) | 1));
+            bytes.bytes_push(out, cast(u8, offset & 0xFF));
+            len = 0;
+        } else if (offset < 65536) {
+            let is i64 as l with mut = len;
+            if (l > 64) { l = 64; }
+            bytes.bytes_push(out, cast(u8, ((l - 1) << 2) | 2));
+            bytes.bytes_push(out, cast(u8, offset & 0xFF));
+            bytes.bytes_push(out, cast(u8, (offset >> 8) & 0xFF));
+            len = len - l;
+        } else {
+            let is i64 as l with mut = len;
+            if (l > 64) { l = 64; }
+            bytes.bytes_push(out, cast(u8, ((l - 1) << 2) | 3));
+            bytes.bytes_push(out, cast(u8, offset & 0xFF));
+            bytes.bytes_push(out, cast(u8, (offset >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (offset >> 16) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (offset >> 24) & 0xFF));
+            len = len - l;
+        }
+    }
+}
+
+fn snappy_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    // varint preamble (uncompressed length)
+    let is i64 as v with mut = src_len;
+    while (1 == 1) {
+        let is i64 as b = v & 0x7F;
+        v = v >> 7;
+        if (v != 0) { bytes.bytes_push(out, cast(u8, b | 0x80)); }
+        else { bytes.bytes_push(out, cast(u8, b)); break; }
+    }
+    if (src_len == 0) { return out.len; }
+
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(65536 * 8));
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), 65536 * 8);
+    let is i64 as i with mut = 0;
+    let is i64 as lit with mut = 0;
+    while (i < src_len) {
+        let is i64 as ml with mut = 0;
+        let is i64 as mo with mut = 0;
+        if (i + 4 <= src_len) {
+            let is i64 as h = _sn_hash(src, i);
+            let is i64 as cand = head[h];
+            head[h] = i;
+            if (cand >= 0) {
+                if (src[cand] == src[i] && src[cand + 1] == src[i + 1]
+                    && src[cand + 2] == src[i + 2] && src[cand + 3] == src[i + 3]) {
+                    let is i64 as l with mut = 4;
+                    while (i + l < src_len) {
+                        if (src[cand + l] != src[i + l]) { break; }
+                        l = l + 1;
+                    }
+                    ml = l; mo = i - cand;
+                }
+            }
+        }
+        if (ml >= 4) {
+            _sn_lit(out, src, lit, i - lit);
+            _sn_copy(out, mo, ml);
+            i = i + ml;
+            lit = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    _sn_lit(out, src, lit, src_len - lit);
+    mem.core.munmap(cast(*u8, head), 65536 * 8);
     return out.len;
 }
