@@ -26,6 +26,8 @@ struct Lzma {
     // sequence state
     state as i64; rep0 as i64; rep1 as i64; rep2 as i64; rep3 as i64;
     dictStart as i64;   // output offset of the current dictionary (LZMA2 reset)
+    // range encoder state
+    elow as i64; ecache as i64; ecacheSize as i64; eout as *bytes.Bytes;
 }
 
 // Allocate the probability model for props byte = (pb*5 + lp)*9 + lc.
@@ -310,5 +312,261 @@ fn lzma_alone_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64
     lzma_rc_init(&lz, src, src_len, 13);
     let is i64 as r = lzma_run(&lz, out, unpackSize, sizeKnown);
     if (r < 0) { return r; }
+    return out.len;
+}
+
+// ===================== LZMA ENCODER =====================================
+fn _renc_init(lz as *Lzma, out as *bytes.Bytes) as void {
+    lz.elow = 0; lz.range = 0xFFFFFFFF; lz.ecache = 0; lz.ecacheSize = 1; lz.eout = out;
+}
+
+fn _renc_shiftlow(lz as *Lzma) as void {
+    let is i64 as hi = lz.elow >> 32;
+    if (hi != 0 || lz.elow < 0xFF000000) {
+        let is i64 as temp with mut = lz.ecache;
+        while (1 == 1) {
+            bytes.bytes_push(lz.eout, cast(u8, (temp + hi) & 0xFF));
+            temp = 0xFF;
+            lz.ecacheSize = lz.ecacheSize - 1;
+            if (lz.ecacheSize == 0) { break; }
+        }
+        lz.ecache = (lz.elow >> 24) & 0xFF;
+    }
+    lz.ecacheSize = lz.ecacheSize + 1;
+    lz.elow = (lz.elow << 8) & 0xFFFFFFFF;
+}
+
+fn _enc_bit(lz as *Lzma, idx as i64, bit as i64) as void {
+    let is i64 as v = lz.probs[idx];
+    let is i64 as bound = (lz.range >> 11) * v;
+    if (bit == 0) {
+        lz.range = bound;
+        lz.probs[idx] = v + ((2048 - v) >> 5);
+    } else {
+        lz.elow = lz.elow + bound;
+        lz.range = lz.range - bound;
+        lz.probs[idx] = v - (v >> 5);
+    }
+    while (lz.range < 0x1000000) {
+        lz.range = (lz.range << 8) & 0xFFFFFFFF;
+        _renc_shiftlow(lz);
+    }
+}
+
+fn _enc_direct(lz as *Lzma, value as i64, numBits as i64) as void {
+    let is i64 as i with mut = numBits;
+    while (i > 0) {
+        i = i - 1;
+        lz.range = lz.range >> 1;
+        let is i64 as b = (value >> i) & 1;
+        if (b != 0) { lz.elow = lz.elow + lz.range; }
+        while (lz.range < 0x1000000) {
+            lz.range = (lz.range << 8) & 0xFFFFFFFF;
+            _renc_shiftlow(lz);
+        }
+    }
+}
+
+fn _enc_bittree(lz as *Lzma, base as i64, numBits as i64, value as i64) as void {
+    let is i64 as m with mut = 1;
+    let is i64 as i with mut = numBits;
+    while (i > 0) {
+        i = i - 1;
+        let is i64 as bit = (value >> i) & 1;
+        _enc_bit(lz, base + m, bit);
+        m = (m << 1) | bit;
+    }
+}
+
+fn _enc_bittree_rev(lz as *Lzma, base as i64, numBits as i64, value as i64) as void {
+    let is i64 as m with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < numBits) {
+        let is i64 as bit = (value >> i) & 1;
+        _enc_bit(lz, base + m, bit);
+        m = (m << 1) | bit;
+        i = i + 1;
+    }
+}
+
+fn _enc_len(lz as *Lzma, isRep as i64, posState as i64, lenValue as i64) as void {
+    let is i64 as cO with mut = lz.o_lenChoice;
+    let is i64 as c2O with mut = lz.o_lenChoice2;
+    let is i64 as loO with mut = lz.o_lenLow;
+    let is i64 as miO with mut = lz.o_lenMid;
+    let is i64 as hiO with mut = lz.o_lenHigh;
+    if (isRep != 0) {
+        cO = lz.o_repChoice; c2O = lz.o_repChoice2;
+        loO = lz.o_repLow; miO = lz.o_repMid; hiO = lz.o_repHigh;
+    }
+    if (lenValue < 8) {
+        _enc_bit(lz, cO, 0);
+        _enc_bittree(lz, loO + (posState << 3), 3, lenValue);
+    } else if (lenValue < 16) {
+        _enc_bit(lz, cO, 1);
+        _enc_bit(lz, c2O, 0);
+        _enc_bittree(lz, miO + (posState << 3), 3, lenValue - 8);
+    } else {
+        _enc_bit(lz, cO, 1);
+        _enc_bit(lz, c2O, 1);
+        _enc_bittree(lz, hiO, 8, lenValue - 16);
+    }
+}
+
+fn _highbit(x as i64) as i64 {
+    let is i64 as i with mut = 62;
+    while (i >= 0) {
+        if ((1 << i) <= x) { return i; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _pos_slot(dist as i64) as i64 {
+    if (dist < 4) { return dist; }
+    let is i64 as n = _highbit(dist);
+    return (n << 1) | ((dist >> (n - 1)) & 1);
+}
+
+fn _enc_distance(lz as *Lzma, lenState as i64, distValue as i64) as void {
+    let is i64 as lps with mut = lenState;
+    if (lps > 3) { lps = 3; }
+    let is i64 as posSlot = _pos_slot(distValue);
+    _enc_bittree(lz, lz.o_posSlot + (lps << 6), 6, posSlot);
+    if (posSlot >= 4) {
+        let is i64 as numDirect = (posSlot >> 1) - 1;
+        let is i64 as base = (2 | (posSlot & 1)) << numDirect;
+        if (posSlot < 14) {
+            _enc_bittree_rev(lz, lz.o_specPos + base - posSlot, numDirect, distValue - base);
+        } else {
+            _enc_direct(lz, (distValue - base) >> 4, numDirect - 4);
+            _enc_bittree_rev(lz, lz.o_align, 4, (distValue - base) & 0xF);
+        }
+    }
+}
+
+fn _enc_literal(lz as *Lzma, src as *u8, pos as i64) as void {
+    let is i64 as prevByte with mut = 0;
+    if (pos > 0) { prevByte = cast(i64, src[pos - 1]); }
+    let is i64 as litState = ((pos & ((1 << lz.lp) - 1)) << lz.lc) + (prevByte >> (8 - lz.lc));
+    let is i64 as base = lz.o_literal + 0x300 * litState;
+    let is i64 as byte = cast(i64, src[pos]);
+    let is i64 as m with mut = 1;
+    let is i64 as i with mut = 0;
+    if (lz.state < 7) {
+        while (i < 8) {
+            let is i64 as bit = (byte >> (7 - i)) & 1;
+            _enc_bit(lz, base + m, bit);
+            m = (m << 1) | bit;
+            i = i + 1;
+        }
+    } else {
+        let is i64 as matchByte = cast(i64, src[pos - lz.rep0 - 1]);
+        let is i64 as matched with mut = 1;
+        while (i < 8) {
+            let is i64 as bit = (byte >> (7 - i)) & 1;
+            if (matched == 1) {
+                let is i64 as matchBit = (matchByte >> (7 - i)) & 1;
+                _enc_bit(lz, base + ((1 + matchBit) << 8) + m, bit);
+                if (matchBit != bit) { matched = 0; }
+            } else {
+                _enc_bit(lz, base + m, bit);
+            }
+            m = (m << 1) | bit;
+            i = i + 1;
+        }
+    }
+}
+
+// greedy hash-chain match finder over src; returns best length (>=0), sets *distOut
+let is *i64 as _ehead with mut;
+let is *i64 as _eprev with mut;
+fn _find_match(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64 {
+    if (pos + 2 > slen) { return 0; }
+    let is i64 as h = ((cast(i64, src[pos]) << 16) ^ (cast(i64, src[pos + 1]) << 8)
+                       ^ cast(i64, src[pos + 2])) & 0xFFFFF;
+    let is i64 as cand with mut = _ehead[h];
+    _eprev[pos & 0xFFFFF] = cand;
+    _ehead[h] = pos;
+    let is i64 as bestLen with mut = 0;
+    let is i64 as bestDist with mut = 0;
+    let is i64 as chain with mut = 0;
+    let is i64 as maxLen with mut = slen - pos;
+    if (maxLen > 273) { maxLen = 273; }
+    while (cand >= 0) {
+        if (pos - cand > 16777216) { break; }
+        if (chain >= 64) { break; }
+        let is i64 as l with mut = 0;
+        while (l < maxLen) {
+            if (src[cand + l] != src[pos + l]) { break; }
+            l = l + 1;
+        }
+        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        cand = _eprev[cand & 0xFFFFF];
+        chain = chain + 1;
+    }
+    distOut[0] = bestDist;
+    return bestLen;
+}
+
+// Encode raw LZMA into out (props lc=3 lp=0 pb=2). Known-size, no end marker.
+fn _lzma_encode(lz as *Lzma, src as *u8, slen as i64, out as *bytes.Bytes) as i64 {
+    _ehead = cast(*i64, mem.core.mmap_anon(1048576 * 8));
+    _eprev = cast(*i64, mem.core.mmap_anon(1048576 * 8));
+    mem.core.memset(cast(*u8, _ehead), cast(i32, 0xFF), 1048576 * 8);
+    _renc_init(lz, out);
+    let is i64 as pos with mut = 0;
+    while (pos < slen) {
+        let is i64 as posState = pos & (lz.numPosStates - 1);
+        let is i64 as dist with mut = 0;
+        let is i64 as mlen with mut = _find_match(src, pos, slen, &dist);
+        if (mlen >= 2 && (mlen >= 3 || dist < 512)) {
+            _enc_bit(lz, lz.o_isMatch + (lz.state << 4) + posState, 1);
+            _enc_bit(lz, lz.o_isRep + lz.state, 0);
+            lz.rep3 = lz.rep2; lz.rep2 = lz.rep1; lz.rep1 = lz.rep0; lz.rep0 = dist - 1;
+            _enc_len(lz, 0, posState, mlen - 2);
+            _enc_distance(lz, mlen - 2, dist - 1);
+            if (lz.state < 7) { lz.state = 7; } else { lz.state = 10; }
+            // insert hash entries for the matched span
+            let is i64 as k with mut = 1;
+            while (k < mlen) {
+                if (pos + k + 2 < slen) {
+                    let is i64 as hh = ((cast(i64, src[pos + k]) << 16) ^ (cast(i64, src[pos + k + 1]) << 8)
+                                       ^ cast(i64, src[pos + k + 2])) & 0xFFFFF;
+                    _eprev[(pos + k) & 0xFFFFF] = _ehead[hh];
+                    _ehead[hh] = pos + k;
+                }
+                k = k + 1;
+            }
+            pos = pos + mlen;
+        } else {
+            _enc_bit(lz, lz.o_isMatch + (lz.state << 4) + posState, 0);
+            _enc_literal(lz, src, pos);
+            if (lz.state < 4) { lz.state = 0; }
+            else if (lz.state < 10) { lz.state = lz.state - 3; }
+            else { lz.state = lz.state - 6; }
+            pos = pos + 1;
+        }
+    }
+    // flush range encoder
+    let is i64 as f with mut = 0;
+    while (f < 5) { _renc_shiftlow(lz); f = f + 1; }
+    mem.core.munmap(cast(*u8, _ehead), 1048576 * 8);
+    mem.core.munmap(cast(*u8, _eprev), 1048576 * 8);
+    return 0;
+}
+
+// ".lzma" alone-format compress (props 0x5D, dict 16 MB, known size).
+fn lzma_alone_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    let is Lzma as lz;
+    if (lzma_init(&lz, 93) < 0) { return errno.Z_OOM; }   // 0x5D = lc3 lp0 pb2
+    lzma_reset_probs(&lz);
+    lz.dictStart = 0;
+    bytes.bytes_push(out, cast(u8, 93));
+    bytes.bytes_push(out, cast(u8, 0));   bytes.bytes_push(out, cast(u8, 0));    // dict size = 0x01000000 (16 MB)
+    bytes.bytes_push(out, cast(u8, 0));   bytes.bytes_push(out, cast(u8, 1));
+    let is i64 as i with mut = 0;
+    while (i < 8) { bytes.bytes_push(out, cast(u8, (src_len >> (8 * i)) & 0xFF)); i = i + 1; }
+    _lzma_encode(&lz, src, src_len, out);
     return out.len;
 }
