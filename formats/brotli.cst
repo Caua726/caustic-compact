@@ -943,3 +943,20 @@ fn brotli_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64
     biw.bw_align(&w);
     return out.len;
 }
+
+fn brotli_cleanup() as void {
+    if (CMD != cast(*i64, 0)) { mem.core.munmap(cast(*u8, CMD), 704 * 4 * 8); CMD = cast(*i64, 0); }
+    if (BLOFF != cast(*i64, 0)) { mem.core.munmap(cast(*u8, BLOFF), 26 * 8); BLOFF = cast(*i64, 0); }
+    if (BLNB != cast(*i64, 0)) { mem.core.munmap(cast(*u8, BLNB), 26 * 8); BLNB = cast(*i64, 0); }
+    if (INSNB != cast(*i64, 0)) { mem.core.munmap(cast(*u8, INSNB), 24 * 8); INSNB = cast(*i64, 0); }
+    if (CPYNB != cast(*i64, 0)) { mem.core.munmap(cast(*u8, CPYNB), 24 * 8); CPYNB = cast(*i64, 0); }
+    if (DSCIO != cast(*i64, 0)) { mem.core.munmap(cast(*u8, DSCIO), 16 * 8); DSCIO = cast(*i64, 0); }
+    if (DSCVO != cast(*i64, 0)) { mem.core.munmap(cast(*u8, DSCVO), 16 * 8); DSCVO = cast(*i64, 0); }
+    if (FIXED != cast(*i64, 0)) { mem.core.munmap(cast(*u8, FIXED), 16 * 8); FIXED = cast(*i64, 0); }
+    if (CLCO != cast(*i64, 0)) { mem.core.munmap(cast(*u8, CLCO), 18 * 8); CLCO = cast(*i64, 0); }
+    if (DSB != cast(*i64, 0)) { mem.core.munmap(cast(*u8, DSB), 32 * 8); DSB = cast(*i64, 0); }
+    if (DOFF != cast(*i64, 0)) { mem.core.munmap(cast(*u8, DOFF), 32 * 8); DOFF = cast(*i64, 0); }
+    if (MHTS != cast(*i64, 0)) { mem.core.munmap(cast(*u8, MHTS), 23 * 8); MHTS = cast(*i64, 0); }
+    if (CTX != cast(*i64, 0)) { mem.core.munmap(cast(*u8, CTX), 2048 * 8); CTX = cast(*i64, 0); }
+    _tab_ready = 0;
+}

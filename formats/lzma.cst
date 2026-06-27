@@ -570,3 +570,20 @@ fn lzma_alone_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as
     _lzma_encode(&lz, src, src_len, out);
     return out.len;
 }
+
+// Free per-call scratch buffers. Safe to call multiple times.
+fn lzma_cleanup(lz as *Lzma) as void {
+    if (lz.probs != cast(*i64, 0)) {
+        mem.core.munmap(cast(*u8, lz.probs), lz.nprobs * 8);
+        lz.probs = cast(*i64, 0);
+        lz.nprobs = 0;
+    }
+    if (_ehead != cast(*i64, 0)) {
+        mem.core.munmap(cast(*u8, _ehead), 1048576 * 8);
+        _ehead = cast(*i64, 0);
+    }
+    if (_eprev != cast(*i64, 0)) {
+        mem.core.munmap(cast(*u8, _eprev), 1048576 * 8);
+        _eprev = cast(*i64, 0);
+    }
+}
