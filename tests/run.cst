@@ -190,6 +190,28 @@ fn rt_case(name as *u8, bin_path as *u8) as i64 {
     return 1;
 }
 
+fn rt_dyn_case(name as *u8, bin_path as *u8) as i64 {
+    io.write_str(io.STDOUT, "  dyn:");
+    io.write_str(io.STDOUT, name);
+    let is i64 as slen with mut = 0;
+    let is *u8 as src = read_whole(bin_path, &slen);
+    if (cast(i64, src) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is bytes.Bytes as comp = bytes.bytes_new(256);
+    if (deflate.deflate_compress(src, slen, &comp, 2) < 0) {
+        bytes.bytes_free(&comp); io.write_str(io.STDOUT, " ... FAIL (enc)\n"); return 1;
+    }
+    let is bytes.Bytes as dec = bytes.bytes_new(256);
+    if (inflate.inflate(comp.ptr, comp.len, &dec) < 0) {
+        bytes.bytes_free(&comp); bytes.bytes_free(&dec);
+        io.write_str(io.STDOUT, " ... FAIL (dec)\n"); return 1;
+    }
+    let is i64 as ok = _same(&dec, src, slen);
+    bytes.bytes_free(&comp); bytes.bytes_free(&dec);
+    if (ok == 1) { io.write_str(io.STDOUT, " ... PASS\n"); return 0; }
+    io.write_str(io.STDOUT, " ... FAIL\n");
+    return 1;
+}
+
 fn suite_deflate() as i64 {
     io.write_str(io.STDOUT, "[encode roundtrip]\n");
     let is i64 as b with mut = 0;
@@ -201,6 +223,10 @@ fn suite_deflate() as i64 {
     b = b + rt_case("binall", "tests/fixtures/binall.bin");
     b = b + rt_case("big",    "tests/fixtures/big.bin");
     b = b + rt_case("window", "tests/fixtures/window.bin");
+    b = b + rt_dyn_case("hello",  "tests/fixtures/hello.bin");
+    b = b + rt_dyn_case("lorem",  "tests/fixtures/lorem.bin");
+    b = b + rt_dyn_case("big",    "tests/fixtures/big.bin");
+    b = b + rt_dyn_case("window", "tests/fixtures/window.bin");
     return b;
 }
 
