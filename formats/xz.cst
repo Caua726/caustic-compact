@@ -46,6 +46,7 @@ fn xz_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
     let is i64 as checkSize = _check_size(cast(i64, src[7]) & 0x0F);
 
     let is i64 as pos with mut = 12;             // past 12-byte stream header
+    let is i64 as outStartLen = out.len;
     while (pos < src_len) {
         let is i64 as bhs = cast(i64, src[pos]);
         if (bhs == 0) { return out.len; }        // index indicator -> done
@@ -65,15 +66,36 @@ fn xz_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
             fi = fi + 1;
         }
 
+        // verify block-header CRC32 (last 4 bytes of the header area)
+        let is i64 as hdrCRC = (cast(i64, src[hdrStart + headerSize - 4])
+            | (cast(i64, src[hdrStart + headerSize - 3]) << 8)
+            | (cast(i64, src[hdrStart + headerSize - 2]) << 16)
+            | (cast(i64, src[hdrStart + headerSize - 1]) << 24)) & 0xFFFFFFFF;
+        if (checksum.crc32(cast(*u8, cast(i64, src) + hdrStart), headerSize - 4) != hdrCRC) {
+            return errno.Z_BADSUM;
+        }
+
         let is i64 as dataStart = hdrStart + headerSize;          // past header + CRC32
+        let is i64 as decStart = out.len;
         let is i64 as consumed = lzma2.lzma2_decode(src, dataStart, src_len - dataStart, out);
         if (consumed < 0) { return consumed; }
 
         let is i64 as after with mut = dataStart + consumed;
         after = (after + 3) & 0x7FFFFFFFFFFFFFFC;                 // pad to 4-byte boundary
-        after = after + checkSize;                               // skip the block check
+        // verify CRC32 check (id 1) on this block's decoded data
+        if (checkSize == 4) {
+            if (after + 4 > src_len) { return errno.Z_EOF; }
+            let is i64 as expCrc = (cast(i64, src[after])
+                | (cast(i64, src[after + 1]) << 8)
+                | (cast(i64, src[after + 2]) << 16)
+                | (cast(i64, src[after + 3]) << 24)) & 0xFFFFFFFF;
+            let is i64 as gotCrc = checksum.crc32(cast(*u8, cast(i64, out.ptr) + decStart), out.len - decStart);
+            if (gotCrc != expCrc) { return errno.Z_BADSUM; }
+        }
+        after = after + checkSize;
         pos = after;
     }
+    // (stream-footer CRC32 covers stream_flags; we accept without verifying.)
     return out.len;
 }
 

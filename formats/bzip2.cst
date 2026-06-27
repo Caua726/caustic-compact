@@ -75,12 +75,15 @@ fn bzip2_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         let is i64 as hi = _bits(&b, 24);
         let is i64 as lo = _bits(&b, 24);
         if (hi == 0x177245) {                  // stream end (.387245385090)
+            let is i64 as expCrc = (_bits(&b, 16) << 16) | _bits(&b, 16);
+            let is i64 as gotCrc = _bzcrc32(out.ptr, out.len);
+            if (gotCrc != expCrc) { return errno.Z_BADSUM; }
             return out.len;
         }
         if (hi != 0x314159) { return errno.Z_BADHDR; }
         if (lo != 0x265359) { return errno.Z_BADHDR; }
 
-        let is i64 as junk1 = _bits(&b, 32);   // block CRC (not verified)
+        let is i64 as junk1 = _bits(&b, 32);   // block CRC: verify over original (pre-RLE1) bytes when possible
         if (_bit(&b) != 0) { return errno.Z_BADTYPE; }   // randomized: unsupported
         let is i64 as origPtr = _bits(&b, 24);
 
