@@ -917,7 +917,7 @@ fn brotli_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
 }
 
 // ---- encode (uncompressed meta-blocks: valid, no compression) ---------
-fn brotli_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+fn _brotli_store(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
     let is biw.BitWriter as w;
     biw.bw_init(&w, out);
     biw.bw_bits(&w, 0, 1);                  // WBITS = 16
@@ -959,4 +959,277 @@ fn brotli_cleanup() as void {
     if (MHTS != cast(*i64, 0)) { mem.core.munmap(cast(*u8, MHTS), 23 * 8); MHTS = cast(*i64, 0); }
     if (CTX != cast(*i64, 0)) { mem.core.munmap(cast(*u8, CTX), 2048 * 8); CTX = cast(*i64, 0); }
     _tab_ready = 0;
+}
+
+// ===================== BROTLI ENCODER (real) ===========================
+// Phase 1: one compressed meta-block, Huffman-coded literals, a single
+// insert-only command (no copies), trivial command/distance trees.
+// Mirrors the decoder exactly: codes are LSB-first canonical via _nextKey.
+
+let is *i64 as _ehead2 with mut;
+let is *i64 as _eprev2 with mut;
+
+// length-limited Huffman (bzip2 BZ2_hbMakeCodeLengths over active symbols).
+fn _bhlen(freq as *i64, nsym as i64, maxLen as i64, out_len as *i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < nsym) { out_len[i] = 0; i = i + 1; }
+    let is i64 as nAct with mut = 0;
+    i = 0; while (i < nsym) { if (freq[i] > 0) { nAct = nAct + 1; } i = i + 1; }
+    if (nAct == 0) { return; }
+    if (nAct == 1) { i = 0; while (i < nsym) { if (freq[i] > 0) { out_len[i] = 1; break; } i = i + 1; } return; }
+    let is i64 as asz = nAct * 2 + 8;
+    let is *i64 as amap = _ia(nAct + 1);
+    let is *i64 as heap = _ia(asz);
+    let is *i64 as weight = _ia(asz);
+    let is *i64 as parent = _ia(asz);
+    let is i64 as alphaSize = nAct;
+    let is i64 as j with mut = 0;
+    i = 0;
+    while (i < nsym) { if (freq[i] > 0) { amap[j] = i; weight[j + 1] = freq[i] << 8; j = j + 1; } i = i + 1; }
+    while (1 == 1) {
+        let is i64 as nNodes with mut = alphaSize;
+        let is i64 as nHeap with mut = 0;
+        heap[0] = 0; weight[0] = 0; parent[0] = 0 - 2;
+        i = 1;
+        while (i <= alphaSize) {
+            parent[i] = 0 - 1; nHeap = nHeap + 1; heap[nHeap] = i;
+            let is i64 as zz with mut = nHeap;
+            let is i64 as tmp = heap[zz];
+            while (weight[tmp] < weight[heap[zz >> 1]]) { heap[zz] = heap[zz >> 1]; zz = zz >> 1; }
+            heap[zz] = tmp;
+            i = i + 1;
+        }
+        while (nHeap > 1) {
+            let is i64 as n1 = heap[1]; heap[1] = heap[nHeap]; nHeap = nHeap - 1;
+            let is i64 as zz1 with mut = 1;
+            let is i64 as tmp1 = heap[zz1];
+            while (1 == 1) {
+                let is i64 as yy with mut = zz1 << 1;
+                if (yy > nHeap) { break; }
+                if (yy < nHeap) { if (weight[heap[yy + 1]] < weight[heap[yy]]) { yy = yy + 1; } }
+                if (weight[tmp1] < weight[heap[yy]]) { break; }
+                heap[zz1] = heap[yy]; zz1 = yy;
+            }
+            heap[zz1] = tmp1;
+            let is i64 as n2 = heap[1]; heap[1] = heap[nHeap]; nHeap = nHeap - 1;
+            let is i64 as zz2 with mut = 1;
+            let is i64 as tmp2 = heap[zz2];
+            while (1 == 1) {
+                let is i64 as yy with mut = zz2 << 1;
+                if (yy > nHeap) { break; }
+                if (yy < nHeap) { if (weight[heap[yy + 1]] < weight[heap[yy]]) { yy = yy + 1; } }
+                if (weight[tmp2] < weight[heap[yy]]) { break; }
+                heap[zz2] = heap[yy]; zz2 = yy;
+            }
+            heap[zz2] = tmp2;
+            nNodes = nNodes + 1;
+            parent[n1] = nNodes; parent[n2] = nNodes;
+            let is i64 as w1 = weight[n1];
+            let is i64 as w2 = weight[n2];
+            let is i64 as lo1 = w1 & 0xFF;
+            let is i64 as lo2 = w2 & 0xFF;
+            let is i64 as mx with mut = lo1;
+            if (lo2 > mx) { mx = lo2; }
+            weight[nNodes] = ((w1 & 0xFFFFFF00) + (w2 & 0xFFFFFF00)) | (1 + mx);
+            parent[nNodes] = 0 - 1; nHeap = nHeap + 1; heap[nHeap] = nNodes;
+            let is i64 as zz3 with mut = nHeap;
+            let is i64 as tmp3 = heap[zz3];
+            while (weight[tmp3] < weight[heap[zz3 >> 1]]) { heap[zz3] = heap[zz3 >> 1]; zz3 = zz3 >> 1; }
+            heap[zz3] = tmp3;
+        }
+        let is i64 as tooLong with mut = 0;
+        i = 1;
+        while (i <= alphaSize) {
+            let is i64 as jj with mut = 0;
+            let is i64 as k with mut = i;
+            while (parent[k] >= 0) { k = parent[k]; jj = jj + 1; }
+            out_len[amap[i - 1]] = jj;
+            if (jj > maxLen) { tooLong = 1; }
+            i = i + 1;
+        }
+        if (tooLong == 0) { break; }
+        i = 1;
+        while (i <= alphaSize) {
+            let is i64 as jj with mut = weight[i] >> 8;
+            jj = 1 + (jj / 2);
+            weight[i] = jj << 8;
+            i = i + 1;
+        }
+    }
+    mem.core.munmap(cast(*u8, amap), (nAct + 1) * 8);
+    mem.core.munmap(cast(*u8, heap), asz * 8);
+    mem.core.munmap(cast(*u8, weight), asz * 8);
+    mem.core.munmap(cast(*u8, parent), asz * 8);
+}
+
+// LSB-first canonical codes (mirrors _buildHuff's _nextKey assignment).
+fn _bhcodes(clen as *i64, nsym as i64, code as *i64) as void {
+    let is i64 as key with mut = 0;
+    let is i64 as len with mut = 1;
+    while (len <= 15) {
+        let is i64 as i with mut = 0;
+        while (i < nsym) {
+            if (clen[i] == len) { code[i] = key; key = _nextKey(key, len); }
+            i = i + 1;
+        }
+        len = len + 1;
+    }
+}
+
+// emit one clcl value using the fixed code-length-code prefix (from FIXED).
+fn _emit_clcl(w as *biw.BitWriter, v as i64) as void {
+    if (v == 0) { biw.bw_bits(w, 0, 2); }
+    else if (v == 1) { biw.bw_bits(w, 7, 4); }
+    else if (v == 2) { biw.bw_bits(w, 3, 3); }
+    else if (v == 3) { biw.bw_bits(w, 2, 2); }
+    else if (v == 4) { biw.bw_bits(w, 1, 2); }
+    else { biw.bw_bits(w, 15, 4); }
+}
+
+// Emit a complex Huffman code description for clen[0..nsym), no 16/17 RLE.
+fn _emit_tree(w as *biw.BitWriter, clen as *i64, nsym as i64) as void {
+    biw.bw_bits(w, 0, 2);                          // simpleCodeOrSkip = 0 (complex, skip 0)
+    let is i64 as lastNZ with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nsym) { if (clen[i] > 0) { lastNZ = i; } i = i + 1; }
+    // clcl frequencies over the code-length tokens [0..lastNZ]
+    let is [18]i64 as clf;
+    i = 0; while (i < 18) { clf[i] = 0; i = i + 1; }
+    i = 0; while (i <= lastNZ) { clf[clen[i]] = clf[clen[i]] + 1; i = i + 1; }
+    let is [18]i64 as clcl;
+    _bhlen(cast(*i64, &clf), 18, 5, cast(*i64, &clcl));
+    let is [18]i64 as clcode;
+    _bhcodes(cast(*i64, &clcl), 18, cast(*i64, &clcode));
+    let is i64 as numCL with mut = 0;
+    i = 0; while (i < 18) { if (clcl[i] > 0) { numCL = numCL + 1; } i = i + 1; }
+    if (numCL == 1) {
+        // single code-length-code: the decoder never reaches space<=0, so it
+        // reads all 18 clcl entries and then consumes 0 bits per token.
+        i = 0; while (i < 18) { _emit_clcl(w, clcl[CLCO[i]]); i = i + 1; }
+    } else {
+        let is i64 as lastCL with mut = 0;
+        i = 0; while (i < 18) { if (clcl[CLCO[i]] > 0) { lastCL = i; } i = i + 1; }
+        i = 0; while (i <= lastCL) { _emit_clcl(w, clcl[CLCO[i]]); i = i + 1; }
+        // emit the symbol code lengths as clcl-coded literal tokens
+        i = 0;
+        while (i <= lastNZ) {
+            let is i64 as t = clen[i];
+            biw.bw_bits(w, clcode[t], clcl[t]);
+            i = i + 1;
+        }
+    }
+}
+
+// find any command symbol whose insert offset matches (copy is unused: the
+// meta-block ends right after the insert, so the copy never executes).
+fn _find_cmd(insOffVal as i64) as i64 {
+    let is i64 as c with mut = 0;
+    while (c < 704) {
+        if (CMD[c * 4 + 1] == insOffVal) { return c; }
+        c = c + 1;
+    }
+    return 0 - 1;
+}
+
+fn _brotli_huff(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    _tabs();
+    let is biw.BitWriter as w;
+    biw.bw_init(&w, out);
+    biw.bw_bits(&w, 0, 1);                          // WBITS = 16
+
+    if (src_len == 0) {
+        biw.bw_bits(&w, 1, 1); biw.bw_bits(&w, 1, 1);   // ISLAST, ISLASTEMPTY
+        biw.bw_align(&w);
+        return out.len;
+    }
+
+    // insert/copy offset tables
+    let is [24]i64 as insOff; let is [24]i64 as cpyOff;
+    insOff[0] = 0; cpyOff[0] = 2;
+    let is i64 as t with mut = 0;
+    while (t < 23) {
+        insOff[t + 1] = insOff[t] + (1 << INSNB[t]);
+        cpyOff[t + 1] = cpyOff[t] + (1 << CPYNB[t]);
+        t = t + 1;
+    }
+
+    // one meta-block covering the whole input (assume < 2^24)
+    biw.bw_bits(&w, 1, 1);                          // ISLAST = 1
+    biw.bw_bits(&w, 0, 1);                          // ISLASTEMPTY = 0
+    let is i64 as mlen = src_len - 1;
+    let is i64 as nibbles with mut = 4;
+    while ((mlen >> (nibbles * 4)) != 0) { nibbles = nibbles + 1; }
+    biw.bw_bits(&w, nibbles - 4, 2);
+    let is i64 as k with mut = 0;
+    while (k < nibbles) { biw.bw_bits(&w, (mlen >> (4 * k)) & 0xF, 4); k = k + 1; }
+    // (ISUNCOMPRESSED bit is only present when not ISLAST)
+
+    // block-type counts: NBLTYPESL=I=D=1 (single bit 0 each)
+    biw.bw_bits(&w, 0, 1);                          // NBLTYPESL = 1
+    biw.bw_bits(&w, 0, 1);                          // NBLTYPESI = 1
+    biw.bw_bits(&w, 0, 1);                          // NBLTYPESD = 1
+    biw.bw_bits(&w, 0, 2);                          // NPOSTFIX = 0
+    biw.bw_bits(&w, 0, 4);                          // NDIRECT = 0
+    biw.bw_bits(&w, 0, 2);                          // context mode for literal block type 0 = LSB6
+
+    // NTREESL = 1, NTREESD = 1 (single bit 0 -> no context map)
+    biw.bw_bits(&w, 0, 1);
+    biw.bw_bits(&w, 0, 1);
+
+    // --- literal tree (emitted first): complex Huffman over 256 bytes ---
+    let is *i64 as lfreq = _ia(256);
+    let is i64 as i with mut = 0;
+    while (i < src_len) { lfreq[cast(i64, src[i])] = lfreq[cast(i64, src[i])] + 1; i = i + 1; }
+    let is *i64 as lclen = _ia(256);
+    let is *i64 as lcode = _ia(256);
+    _bhlen(lfreq, 256, 15, lclen);
+    _bhcodes(lclen, 256, lcode);
+    _emit_tree(&w, lclen, 256);
+
+    // --- command tree: simple, 1 symbol (an insert command) ---
+    let is i64 as ic with mut = 0;
+    while (ic < 23 && insOff[ic + 1] <= src_len) { ic = ic + 1; }
+    let is i64 as cmdSym = _find_cmd(insOff[ic]);
+    let is i64 as insNbits = CMD[cmdSym * 4] & 0xFF;
+    let is i64 as cpyNbits = CMD[cmdSym * 4] >> 8;
+    biw.bw_bits(&w, 1, 2);                          // simpleCodeOrSkip = 1 (simple)
+    biw.bw_bits(&w, 0, 2);                          // numSymbols-1 = 0 (1 symbol)
+    biw.bw_bits(&w, cmdSym, 10);                    // maxBits=10 for alpha 704
+
+    // --- distance tree: simple, 1 symbol (symbol 0) ---
+    biw.bw_bits(&w, 1, 2);
+    biw.bw_bits(&w, 0, 2);
+    biw.bw_bits(&w, 0, 6);                          // maxBits=6 for alpha 64
+
+    // --- command: insert all src_len literals (copy never executes) ---
+    // (single-symbol command tree consumes 0 bits for the symbol)
+    biw.bw_bits(&w, src_len - insOff[ic], insNbits);   // insert extra bits
+    if (cpyNbits > 0) { biw.bw_bits(&w, 0, cpyNbits); }   // copy extra bits (unused)
+
+    // --- the literals ---
+    i = 0;
+    while (i < src_len) {
+        let is i64 as c = cast(i64, src[i]);
+        biw.bw_bits(&w, lcode[c], lclen[c]);
+        i = i + 1;
+    }
+    biw.bw_align(&w);
+    mem.core.munmap(cast(*u8, lfreq), 256 * 8);
+    mem.core.munmap(cast(*u8, lclen), 256 * 8);
+    mem.core.munmap(cast(*u8, lcode), 256 * 8);
+    return out.len;
+}
+
+// Public entry: emit the smaller of the Huffman-literal block and the
+// uncompressed (store) block, so output is never larger than store mode.
+fn brotli_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    let is bytes.Bytes as huff = bytes.bytes_new(256);
+    _brotli_huff(src, src_len, &huff, level);
+    let is bytes.Bytes as store = bytes.bytes_new(256);
+    _brotli_store(src, src_len, &store, level);
+    if (huff.len <= store.len) { bytes.bytes_append(out, huff.ptr, huff.len); }
+    else { bytes.bytes_append(out, store.ptr, store.len); }
+    bytes.bytes_free(&huff);
+    bytes.bytes_free(&store);
+    return out.len;
 }
