@@ -33,7 +33,7 @@ This is an honest list of where it stops short of the reference implementations.
 
 - **zstd and brotli encode are store mode** — valid and tool-decodable, but they do not actually compress. The real FSE/Huffman (zstd) and prefix-code/context (brotli) encoders are not written.
 - **DEFLATE encode uses fixed Huffman only** — no dynamic Huffman and no stored-block fallback, so incompressible data grows a few percent.
-- **bzip2 encode is single-block** (≤ 900 KB) and uses two identical Huffman tables instead of the reference's up-to-six.
+- **bzip2 encode uses two identical Huffman tables** instead of the reference's up-to-six (multi-block for inputs over 900 KB is supported).
 - **Decode does not verify checksums** for zstd / xz / bzip2 (gzip / zlib / lz4 do).
 - **Snappy is the raw block format**, not the framed `.sz` stream format.
 - One-shot and in-memory — no streaming API. No large-window Brotli, no xz delta/BCJ filters, no dictionaries.
