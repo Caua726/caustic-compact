@@ -786,34 +786,31 @@ fn _encode_seqs(llenA as *i64, mlenA as *i64, distA as *i64, nseq as i64, blk as
     return 0;
 }
 
-// Greedy hash-chain match finder over src[start, start+blen); fills the
-// sequence arrays and the literals buffer. Returns the sequence count.
-fn _find_sequences(src as *u8, start as i64, blen as i64, llenA as *i64, mlenA as *i64,
-                   distA as *i64, litbuf as *bytes.Bytes) as i64 {
+// Greedy hash-chain match finder over src[start, end), using a PERSISTENT
+// global head/prev (absolute positions) so matches can reference earlier
+// blocks (the zstd window spans blocks). Fills the sequence arrays and the
+// literals buffer; returns the sequence count.
+fn _find_sequences(src as *u8, start as i64, end as i64, head as *i64, prev as *i64,
+                   llenA as *i64, mlenA as *i64, distA as *i64, litbuf as *bytes.Bytes) as i64 {
     let is i64 as HSIZE with imut = 32768;
-    let is *i64 as head = cast(*i64, mem.core.mmap_anon(HSIZE * 8));
-    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((blen + 1) * 8));
-    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), HSIZE * 8);
-    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (blen + 1) * 8);
     let is i64 as nseq with mut = 0;
     let is i64 as pos with mut = start;
     let is i64 as anchor with mut = start;
-    let is i64 as end = start + blen;
     while (pos + 3 <= end) {
         let is i64 as h = ((cast(i64, src[pos]) << 10) ^ (cast(i64, src[pos + 1]) << 5)
                           ^ cast(i64, src[pos + 2])) & (HSIZE - 1);
         let is i64 as cand with mut = head[h];
-        prev[pos - start] = cand;
+        prev[pos] = cand;
         head[h] = pos;
         let is i64 as bestLen with mut = 0;
         let is i64 as bestDist with mut = 0;
         let is i64 as chain with mut = 0;
-        while (cand >= start) {
-            if (chain >= 64) { break; }
+        while (cand >= 0) {
+            if (chain >= 128) { break; }
             let is i64 as l with mut = 0;
             while (pos + l < end) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
             if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
-            cand = prev[cand - start];
+            cand = prev[cand];
             chain = chain + 1;
         }
         if (bestLen >= 3) {
@@ -826,7 +823,7 @@ fn _find_sequences(src as *u8, start as i64, blen as i64, llenA as *i64, mlenA a
                 if (pos + k + 3 <= end) {
                     let is i64 as hk = ((cast(i64, src[pos + k]) << 10) ^ (cast(i64, src[pos + k + 1]) << 5)
                                        ^ cast(i64, src[pos + k + 2])) & (HSIZE - 1);
-                    prev[pos + k - start] = head[hk];
+                    prev[pos + k] = head[hk];
                     head[hk] = pos + k;
                 }
                 k = k + 1;
@@ -838,8 +835,6 @@ fn _find_sequences(src as *u8, start as i64, blen as i64, llenA as *i64, mlenA a
         }
     }
     if (anchor < end) { bytes.bytes_append(litbuf, cast(*u8, cast(i64, src) + anchor), end - anchor); }
-    mem.core.munmap(cast(*u8, head), HSIZE * 8);
-    mem.core.munmap(cast(*u8, prev), (blen + 1) * 8);
     return nseq;
 }
 
@@ -852,6 +847,12 @@ fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
     bytes.bytes_push(out, cast(u8, (src_len >> 8) & 0xFF));
     bytes.bytes_push(out, cast(u8, (src_len >> 16) & 0xFF));
     bytes.bytes_push(out, cast(u8, (src_len >> 24) & 0xFF));
+
+    let is i64 as HSIZE with imut = 32768;
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(HSIZE * 8));
+    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), HSIZE * 8);
+    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (src_len + 1) * 8);
 
     let is i64 as pos with mut = 0;
     let is i64 as first with mut = 1;
@@ -866,7 +867,7 @@ fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
         let is *i64 as mlenA = _ialloc(blockSize + 1);
         let is *i64 as distA = _ialloc(blockSize + 1);
         let is bytes.Bytes as litbuf = bytes.bytes_new(256);
-        let is i64 as nseq = _find_sequences(src, pos, blockSize, llenA, mlenA, distA, &litbuf);
+        let is i64 as nseq = _find_sequences(src, pos, pos + blockSize, head, prev, llenA, mlenA, distA, &litbuf);
 
         let is bytes.Bytes as blk = bytes.bytes_new(256);
         _emit_lit_header(&blk, litbuf.len);
@@ -894,5 +895,7 @@ fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
         mem.core.munmap(cast(*u8, distA), (blockSize + 1) * 8);
         pos = pos + blockSize;
     }
+    mem.core.munmap(cast(*u8, head), HSIZE * 8);
+    mem.core.munmap(cast(*u8, prev), (src_len + 1) * 8);
     return out.len;
 }
