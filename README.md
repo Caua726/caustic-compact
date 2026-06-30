@@ -21,7 +21,7 @@ Around 4,600 lines of Caustic across ~20 modules — one file per format under `
 | LZMA / LZMA2 / xz | yes | yes — range coder + greedy matcher |
 | bzip2 | yes | yes — BWT + MTF + Huffman |
 | Zstandard — RFC 8878 | yes | yes — FSE-coded sequences (raw literals) |
-| Brotli — RFC 7932 | yes | store mode (uncompressed meta-blocks) |
+| Brotli — RFC 7932 | yes | yes — Huffman literals (+ store fallback) |
 
 The keystone is `formats/inflate.cst` (raw DEFLATE); zlib, gzip, and PNG's IDAT stream are thin containers over it. zstd and brotli are full decoders — brotli ships the entire 122 KB static dictionary and its 121 word transforms; zstd has the FSE entropy decoder, Huffman literals, and the sequence machine with its offset history.
 
@@ -32,7 +32,7 @@ The whole library, decode and encode, is exercised by one test runner (itself a 
 This is an honest list of where it stops short of the reference implementations.
 
 - **zstd encode uses raw literals** — the LZ77 sequences are FSE-coded with cross-block matching, which is competitive with `zstd -19` on the test corpus (often within a few percent, sometimes smaller). Literals are not yet Huffman-coded, so inputs whose post-match literals are *both* large and low-entropy would lag; high-entropy literals (the common case) cost the same either way.
-- **brotli encode is store mode** — valid and tool-decodable, but does not actually compress. The real prefix-code/context encoder is not written.
+- **brotli encode does Huffman literals only** — one compressed meta-block with Huffman-coded literals (and a store fallback so it is never worse than store mode), but no backward references yet. It beats store mode on text but trails `brotli -q11` (which uses LZ77 matches + context modeling). Match support is the next step.
 - **DEFLATE encode uses fixed Huffman only** — no dynamic Huffman and no stored-block fallback, so incompressible data grows a few percent.
 - **bzip2 encode uses two identical Huffman tables** instead of the reference's up-to-six (multi-block for inputs over 900 KB is supported).
 - **Decode does not verify checksums** for zstd / xz / bzip2 (gzip / zlib / lz4 do).
