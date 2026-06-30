@@ -355,6 +355,7 @@ fn suite_encode_modern() as i64 {
     b = b + enc_rt(7, "bz2:lorem",  "tests/fixtures/lorem.bin");
     b = b + enc_rt(7, "bz2:window", "tests/fixtures/window.bin");
     b = b + enc_rt(7, "bz2:big",    "tests/fixtures/big.bin");
+    b = b + enc_rt(7, "bz2:multi",  "tests/fixtures/big2.bin");
     b = b + enc_rt(8, "zstd:hello",  "tests/fixtures/hello.bin");
     b = b + enc_rt(8, "zstd:lorem",  "tests/fixtures/lorem.bin");
     b = b + enc_rt(8, "zstd:window", "tests/fixtures/window.bin");
