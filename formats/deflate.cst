@@ -199,18 +199,6 @@ fn _deflate_fixed(bw as *bitwriter.BitWriter, src as *u8, src_len as i64) as i64
     return 0;
 }
 
-// --- public API --------------------------------------------------------
-fn deflate_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
-    _enc_init();
-    let is bitwriter.BitWriter as bw;
-    bitwriter.bw_init(&bw, out);
-    let is i64 as r with mut = 0;
-    if (level <= 0) { r = _deflate_stored(&bw, src, src_len); }
-    else { r = _deflate_fixed(&bw, src, src_len); }
-    if (r < 0) { return r; }
-    if (bw.err < 0) { return errno.Z_OOM; }
-    return out.len;
-}
 
 // ===================== DYNAMIC HUFFMAN ==================================
 // Two-pass: collect (lit,len,dist) symbol frequencies during matching, then
@@ -291,163 +279,102 @@ fn _dyn_collect(src as *u8, src_len as i64, litFreq as *i64, distFreq as *i64) a
 fn _build_lengths(freq as *i64, nsym as i64, maxLen as i64, out_len as *i64) as void {
     let is i64 as i with mut = 0;
     while (i < nsym) { out_len[i] = 0; i = i + 1; }
-    if (nsym < 2) { out_len[0] = 1; return; }
-
-    // count active symbols
     let is i64 as nAct with mut = 0;
     i = 0;
     while (i < nsym) { if (freq[i] > 0) { nAct = nAct + 1; } i = i + 1; }
     if (nAct == 0) { return; }
     if (nAct == 1) {
         i = 0;
-        while (i < nsym) {
-            if (freq[i] > 0) { out_len[i] = 1; break; }
-            i = i + 1;
-        }
+        while (i < nsym) { if (freq[i] > 0) { out_len[i] = 1; break; } i = i + 1; }
         return;
     }
-
-    // priority queue of (count<<17 | sym)
-    let is i64 as qn with imut = nAct * 2;
-    let is *i64 as pq = _tab(qn);
-    let is i64 as qsz with mut = 0;
+    // compact active symbols and run the bzip2 length-limited Huffman
+    let is i64 as asz = nAct * 2 + 8;
+    let is *i64 as amap = _tab(nAct + 1);
+    let is *i64 as heap = _tab(asz);
+    let is *i64 as weight = _tab(asz);
+    let is *i64 as parent = _tab(asz);
+    let is i64 as alphaSize = nAct;
+    let is i64 as j with mut = 0;
     i = 0;
     while (i < nsym) {
-        if (freq[i] > 0) {
-            pq[qsz] = (freq[i] << 17) | i; qsz = qsz + 1;
-        }
+        if (freq[i] > 0) { amap[j] = i; weight[j + 1] = freq[i] << 8; j = j + 1; }
         i = i + 1;
     }
-    // heapify (min-heap on count, tie-break by sym)
-    let is i64 as h_last with mut = qsz - 1;
-    let is i64 as hh with mut = (h_last - 1) / 2;
-    while (hh >= 0) {
-        let is i64 as v = pq[hh];
-        let is i64 as j with mut = hh;
-        while (1 == 1) {
-            let is i64 as k with mut = 2 * j + 1;
-            if (k > h_last) { break; }
-            if (k < h_last) {
-                if (((pq[k] >> 17) > (pq[k + 1] >> 17))
-                    || (((pq[k] >> 17) == (pq[k + 1] >> 17)) && (pq[k] & 0x1FFFF) > (pq[k + 1] & 0x1FFFF))) {
-                    k = k + 1;
-                }
-            }
-            if (((v >> 17) < (pq[k] >> 17))
-                || (((v >> 17) == (pq[k] >> 17)) && ((v & 0x1FFFF) <= (pq[k] & 0x1FFFF)))) { break; }
-            pq[j] = pq[k]; j = k;
-        }
-        pq[j] = v;
-        hh = hh - 1;
-    }
-
-    // parent[] for tree assembly (we index by [0..2*nAct))
-    let is *i64 as par = _tab(qn);
-    let is i64 as used with mut = nsym;
-    while (qsz > 1) {
-        // pop min
-        let is i64 as a = pq[0];
-        pq[0] = pq[qsz - 1]; qsz = qsz - 1;
-        let is i64 as cur with mut = 0;
-        while (1 == 1) {
-            let is i64 as k with mut = 2 * cur + 1;
-            if (k > qsz - 1) { break; }
-            if (k < qsz - 1) {
-                if (((pq[k] >> 17) > (pq[k + 1] >> 17))
-                    || (((pq[k] >> 17) == (pq[k + 1] >> 17)) && (pq[k] & 0x1FFFF) > (pq[k + 1] & 0x1FFFF))) {
-                    k = k + 1;
-                }
-            }
-            if (((pq[cur] >> 17) < (pq[k] >> 17))
-                || (((pq[cur] >> 17) == (pq[k] >> 17)) && ((pq[cur] & 0x1FFFF) <= (pq[k] & 0x1FFFF)))) { break; }
-            pq[k] = pq[cur]; cur = k;
-        }
-        let is i64 as b = pq[cur];
-        pq[cur] = pq[qsz - 1]; qsz = qsz - 1;
-        while (1 == 1) {
-            let is i64 as k with mut = 2 * cur + 1;
-            if (k > qsz - 1) { break; }
-            if (k < qsz - 1) {
-                if (((pq[k] >> 17) > (pq[k + 1] >> 17))
-                    || (((pq[k] >> 17) == (pq[k + 1] >> 17)) && (pq[k] & 0x1FFFF) > (pq[k + 1] & 0x1FFFF))) {
-                    k = k + 1;
-                }
-            }
-            if (((pq[cur] >> 17) < (pq[k] >> 17))
-                || (((pq[cur] >> 17) == (pq[k] >> 17)) && ((pq[cur] & 0x1FFFF) <= (pq[k] & 0x1FFFF)))) { break; }
-            pq[k] = pq[cur]; cur = k;
-        }
-        let is i64 as ca = a >> 17;
-        let is i64 as cb = b >> 17;
-        let is i64 as sa = a & 0x1FFFF;
-        let is i64 as sb = b & 0x1FFFF;
-        let is i64 as sum with mut = ca + cb;
-        let is i64 as newSym with mut = sa;
-        if (sb < newSym) { newSym = sb; }
-        pq[cur] = (sum << 17) | used;
-        par[sa] = used; par[sb] = used;
-        used = used + 1;
-    }
-    // set lengths from depth in tree (root is pq[0] sym)
-    let is i64 as root = pq[0] & 0x1FFFF;
-    let is *i64 as depth = _tab(qn);
-    let is i64 as stack with mut = 0;
-    let is *i64 as st = _tab(qn);
-    let is *i64 as sit = _tab(qn);
-    st[0] = root; sit[0] = 0; stack = 1;
-    while (stack > 0) {
-        stack = stack - 1;
-        let is i64 as n = st[stack];
-        let is i64 as d = sit[stack];
-        if (n >= nsym) { depth[n] = d; }
-        else { out_len[n] = d; }
-        if (n < nsym) { continue; }
-        st[stack] = par[0]; sit[stack] = d + 1; stack = stack + 1;
-        st[stack] = n;     sit[stack] = d + 1; stack = stack + 1;
-    }
-    // BFS: assign depths to non-leaf internal nodes (depth was 0)
-    i = 0;
-    while (i < used) {
-        if (depth[i] == 0 && i >= nsym) {
-            st[0] = i; sit[0] = 0; stack = 1;
-            while (stack > 0) {
-                stack = stack - 1;
-                let is i64 as nd = st[stack];
-                let is i64 as dd = sit[stack];
-                if (depth[nd] < dd) { depth[nd] = dd; }
-                if (nd >= nsym) {
-                    st[stack] = par[0]; sit[stack] = dd + 1; stack = stack + 1;
-                    st[stack] = nd;     sit[stack] = dd + 1; stack = stack + 1;
-                }
-            }
-        }
-        i = i + 1;
-    }
-
-    // enforce maxLen: any leaf > maxLen gets capped, redistributing budget
-    let is i64 as over with mut = 0;
-    i = 0;
-    while (i < nsym) {
-        if (out_len[i] > maxLen) { over = over + (out_len[i] - maxLen); out_len[i] = maxLen; }
-        i = i + 1;
-    }
-    while (over > 0) {
-        let is i64 as done with mut = 0;
-        i = 0;
-        while (i < nsym) {
-            if (over == 0) { break; }
-            if (out_len[i] > 0 && out_len[i] < maxLen) {
-                out_len[i] = out_len[i] + 1; over = over - 1; done = 1;
-            }
+    while (1 == 1) {
+        let is i64 as nNodes with mut = alphaSize;
+        let is i64 as nHeap with mut = 0;
+        heap[0] = 0; weight[0] = 0; parent[0] = 0 - 2;
+        i = 1;
+        while (i <= alphaSize) {
+            parent[i] = 0 - 1; nHeap = nHeap + 1; heap[nHeap] = i;
+            let is i64 as zz with mut = nHeap;
+            let is i64 as tmp = heap[zz];
+            while (weight[tmp] < weight[heap[zz >> 1]]) { heap[zz] = heap[zz >> 1]; zz = zz >> 1; }
+            heap[zz] = tmp;
             i = i + 1;
         }
-        if (done == 0) { break; }
+        while (nHeap > 1) {
+            let is i64 as n1 = heap[1]; heap[1] = heap[nHeap]; nHeap = nHeap - 1;
+            let is i64 as zz1 with mut = 1;
+            let is i64 as tmp1 = heap[zz1];
+            while (1 == 1) {
+                let is i64 as yy with mut = zz1 << 1;
+                if (yy > nHeap) { break; }
+                if (yy < nHeap) { if (weight[heap[yy + 1]] < weight[heap[yy]]) { yy = yy + 1; } }
+                if (weight[tmp1] < weight[heap[yy]]) { break; }
+                heap[zz1] = heap[yy]; zz1 = yy;
+            }
+            heap[zz1] = tmp1;
+            let is i64 as n2 = heap[1]; heap[1] = heap[nHeap]; nHeap = nHeap - 1;
+            let is i64 as zz2 with mut = 1;
+            let is i64 as tmp2 = heap[zz2];
+            while (1 == 1) {
+                let is i64 as yy with mut = zz2 << 1;
+                if (yy > nHeap) { break; }
+                if (yy < nHeap) { if (weight[heap[yy + 1]] < weight[heap[yy]]) { yy = yy + 1; } }
+                if (weight[tmp2] < weight[heap[yy]]) { break; }
+                heap[zz2] = heap[yy]; zz2 = yy;
+            }
+            heap[zz2] = tmp2;
+            nNodes = nNodes + 1;
+            parent[n1] = nNodes; parent[n2] = nNodes;
+            let is i64 as w1 = weight[n1];
+            let is i64 as w2 = weight[n2];
+            let is i64 as lo1 = w1 & 0xFF;
+            let is i64 as lo2 = w2 & 0xFF;
+            let is i64 as mx with mut = lo1;
+            if (lo2 > mx) { mx = lo2; }
+            weight[nNodes] = ((w1 & 0xFFFFFF00) + (w2 & 0xFFFFFF00)) | (1 + mx);
+            parent[nNodes] = 0 - 1; nHeap = nHeap + 1; heap[nHeap] = nNodes;
+            let is i64 as zz3 with mut = nHeap;
+            let is i64 as tmp3 = heap[zz3];
+            while (weight[tmp3] < weight[heap[zz3 >> 1]]) { heap[zz3] = heap[zz3 >> 1]; zz3 = zz3 >> 1; }
+            heap[zz3] = tmp3;
+        }
+        let is i64 as tooLong with mut = 0;
+        i = 1;
+        while (i <= alphaSize) {
+            let is i64 as jj with mut = 0;
+            let is i64 as k with mut = i;
+            while (parent[k] >= 0) { k = parent[k]; jj = jj + 1; }
+            out_len[amap[i - 1]] = jj;
+            if (jj > maxLen) { tooLong = 1; }
+            i = i + 1;
+        }
+        if (tooLong == 0) { break; }
+        i = 1;
+        while (i <= alphaSize) {
+            let is i64 as jj with mut = weight[i] >> 8;
+            jj = 1 + (jj / 2);
+            weight[i] = jj << 8;
+            i = i + 1;
+        }
     }
-    mem.core.munmap(cast(*u8, pq), qn * 8);
-    mem.core.munmap(cast(*u8, par), qn * 8);
-    mem.core.munmap(cast(*u8, depth), qn * 8);
-    mem.core.munmap(cast(*u8, st), qn * 8);
-    mem.core.munmap(cast(*u8, sit), qn * 8);
+    mem.core.munmap(cast(*u8, amap), (nAct + 1) * 8);
+    mem.core.munmap(cast(*u8, heap), asz * 8);
+    mem.core.munmap(cast(*u8, weight), asz * 8);
+    mem.core.munmap(cast(*u8, parent), asz * 8);
 }
 
 // RLE-encode a length table in the DEFLATE code-length alphabet (16/17/18).
@@ -457,34 +384,28 @@ fn _rle_cl(lengths as *i64, nsym as i64, out as *i64) as i64 {
     let is i64 as n with mut = 0;
     while (i < nsym) {
         let is i64 as v = lengths[i];
-        let is i64 as run with mut = 1;
-        while (i + run < nsym && lengths[i + run] == v && run < 138) { run = run + 1; }
+        let is i64 as cnt with mut = 1;
+        while (i + cnt < nsym && lengths[i + cnt] == v && cnt < 138) { cnt = cnt + 1; }
+        i = i + cnt;                       // advance past the whole run
         if (v == 0) {
-            while (run >= 11) {
+            while (cnt >= 11) {
                 let is i64 as k with mut = 138;
-                if (run < k) { k = run; }
+                if (cnt < k) { k = cnt; }
                 out[n] = 18; n = n + 1; out[n] = k - 11; n = n + 1;
-                run = run - k;
+                cnt = cnt - k;
             }
-            if (run >= 3) { out[n] = 17; n = n + 1; out[n] = run - 3; n = n + 1; run = 0; }
+            if (cnt >= 3) { out[n] = 17; n = n + 1; out[n] = cnt - 3; n = n + 1; cnt = 0; }
+            while (cnt > 0) { out[n] = 0; n = n + 1; cnt = cnt - 1; }
         } else {
-            out[n] = v; n = n + 1; run = run - 1;
-            while (run >= 3) {
+            out[n] = v; n = n + 1; cnt = cnt - 1;       // first copy literally
+            while (cnt >= 3) {
                 let is i64 as k with mut = 6;
-                if (run < k) { k = run; }
-                out[n] = 16; n = n + 1; out[n] = k - 3; n = n + 1;
-                run = run - k;
+                if (cnt < k) { k = cnt; }
+                out[n] = 16; n = n + 1; out[n] = k - 3; n = n + 1;   // repeat previous
+                cnt = cnt - k;
             }
+            while (cnt > 0) { out[n] = v; n = n + 1; cnt = cnt - 1; }
         }
-        while (run > 0) {
-            if (v == 0) {
-                out[n] = 0; n = n + 1;
-            } else {
-                out[n] = v; n = n + 1;
-            }
-            run = run - 1;
-        }
-        i = i + run;
     }
     return n;
 }
@@ -534,38 +455,62 @@ fn _build_codes(lengths as *i64, nsym as i64, codes as *i64) as void {
     mem.core.munmap(cast(*u8, bl_count), 16 * 8);
 }
 
+// DEFLATE requires complete Huffman trees; a tree with a single code is
+// incomplete, so pad it to two length-1 codes (the second is never emitted).
+fn _pad_tree(lengths as *i64, nsym as i64) as void {
+    let is i64 as nz with mut = 0;
+    let is i64 as first with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < nsym) {
+        if (lengths[i] > 0) { nz = nz + 1; if (first < 0) { first = i; } }
+        i = i + 1;
+    }
+    if (nz == 0) { lengths[0] = 1; lengths[1] = 1; }
+    else if (nz == 1) {
+        if (first == 0) { lengths[1] = 1; } else { lengths[0] = 1; }
+    }
+}
+
 // Emit a dynamic block. litLen/dstFre are populated by _dyn_collect.
 fn _deflate_dynamic(bw as *bitwriter.BitWriter, src as *u8, src_len as i64, litFreq as *i64, distFreq as *i64) as i64 {
     let is *i64 as llLen = _tab(288);
     let is *i64 as ddLen = _tab(30);
     _build_lengths(litFreq, 286, 15, llLen);
     _build_lengths(distFreq, 30, 15, ddLen);
+    _pad_tree(llLen, 286);
+    _pad_tree(ddLen, 30);
     let is *i64 as llCode = _tab(288);
     let is *i64 as ddCode = _tab(30);
     _build_codes(llLen, 286, llCode);
     _build_codes(ddLen, 30, ddCode);
 
-    // RLE-encode the length table into the 19-slot cl alphabet
-    let is *i64 as clFreq = _tab(19);
-    let is *i64 as llRle = _tab(2 * 286 + 8);
-    let is *i64 as ddRle = _tab(2 * 30 + 8);
-    let is i64 as llRleN = _rle_cl(llLen, 286, llRle);
-    let is i64 as ddRleN = _rle_cl(ddLen, 30, ddRle);
-
-    let is i64 as i with mut = 0;
-    while (i < llRleN) { clFreq[llRle[i]] = clFreq[llRle[i]] + 1; i = i + 1; }
-    i = 0;
-    while (i < ddRleN) { clFreq[ddRle[i]] = clFreq[ddRle[i]] + 1; i = i + 1; }
-    let is *i64 as clLen = _tab(19);
-    let is *i64 as clCode = _tab(19);
-    _build_lengths(clFreq, 19, 7, clLen);
-    _build_codes(clLen, 19, clCode);
-
-    // HLIT/HDIST/HCLEN
+    // HLIT / HDIST (trim trailing zero code-lengths)
     let is i64 as nLit with mut = 286;
     while (nLit > 257 && llLen[nLit - 1] == 0) { nLit = nLit - 1; }
     let is i64 as nDist with mut = 30;
     while (nDist > 1 && ddLen[nDist - 1] == 0) { nDist = nDist - 1; }
+
+    // Concatenate exactly nLit lit/len + nDist dist code-lengths, then RLE.
+    let is *i64 as combined = _tab(nLit + nDist + 2);
+    let is i64 as i with mut = 0;
+    while (i < nLit) { combined[i] = llLen[i]; i = i + 1; }
+    i = 0;
+    while (i < nDist) { combined[nLit + i] = ddLen[i]; i = i + 1; }
+    let is *i64 as clFreq = _tab(19);
+    let is *i64 as rle = _tab(2 * (nLit + nDist) + 8);
+    let is i64 as rleN = _rle_cl(combined, nLit + nDist, rle);
+    i = 0;
+    while (i < rleN) {
+        clFreq[rle[i]] = clFreq[rle[i]] + 1;
+        if (rle[i] >= 16) { i = i + 1; }                   // skip the extra-bits operand
+        i = i + 1;
+    }
+    let is *i64 as clLen = _tab(19);
+    let is *i64 as clCode = _tab(19);
+    _build_lengths(clFreq, 19, 7, clLen);
+    _pad_tree(clLen, 19);
+    _build_codes(clLen, 19, clCode);
+
     let is i64 as nCLen with mut = 19;
     while (nCLen > 4 && clLen[_CLORDER[nCLen - 1]] == 0) { nCLen = nCLen - 1; }
     bitwriter.bw_bits(bw, 1, 1);                            // BFINAL
@@ -576,23 +521,14 @@ fn _deflate_dynamic(bw as *bitwriter.BitWriter, src as *u8, src_len as i64, litF
     i = 0;
     while (i < nCLen) { bitwriter.bw_bits(bw, clLen[_CLORDER[i]], 3); i = i + 1; }
 
-    // emit lit/len RLE using cl table
+    // emit the RLE'd code-length sequence using the cl table
     i = 0;
-    while (i < llRleN) {
-        let is i64 as s = llRle[i];
-        bitwriter.bw_huff(bw, clCode[s], clLen[s]);
-        if (s == 16) { bitwriter.bw_bits(bw, llRle[i + 1], 2); i = i + 1; }
-        else if (s == 17) { bitwriter.bw_bits(bw, llRle[i + 1], 3); i = i + 1; }
-        else if (s == 18) { bitwriter.bw_bits(bw, llRle[i + 1], 7); i = i + 1; }
-        i = i + 1;
-    }
-    i = 0;
-    while (i < ddRleN) {
-        let is i64 as s = ddRle[i];
-        bitwriter.bw_huff(bw, clCode[s], clLen[s]);
-        if (s == 16) { bitwriter.bw_bits(bw, ddRle[i + 1], 2); i = i + 1; }
-        else if (s == 17) { bitwriter.bw_bits(bw, ddRle[i + 1], 3); i = i + 1; }
-        else if (s == 18) { bitwriter.bw_bits(bw, ddRle[i + 1], 7); i = i + 1; }
+    while (i < rleN) {
+        let is i64 as cs = rle[i];
+        bitwriter.bw_huff(bw, clCode[cs], clLen[cs]);
+        if (cs == 16) { bitwriter.bw_bits(bw, rle[i + 1], 2); i = i + 1; }
+        else if (cs == 17) { bitwriter.bw_bits(bw, rle[i + 1], 3); i = i + 1; }
+        else if (cs == 18) { bitwriter.bw_bits(bw, rle[i + 1], 7); i = i + 1; }
         i = i + 1;
     }
 
@@ -652,8 +588,8 @@ fn _deflate_dynamic(bw as *bitwriter.BitWriter, src as *u8, src_len as i64, litF
     mem.core.munmap(cast(*u8, clFreq), 19 * 8);
     mem.core.munmap(cast(*u8, clLen), 19 * 8);
     mem.core.munmap(cast(*u8, clCode), 19 * 8);
-    mem.core.munmap(cast(*u8, llRle), (2 * 286 + 8) * 8);
-    mem.core.munmap(cast(*u8, ddRle), (2 * 30 + 8) * 8);
+    mem.core.munmap(cast(*u8, combined), (nLit + nDist + 2) * 8);
+    mem.core.munmap(cast(*u8, rle), (2 * (nLit + nDist) + 8) * 8);
     return 0;
 }
 
@@ -671,13 +607,33 @@ fn _deflate_dynamic_entry(bw as *bitwriter.BitWriter, src as *u8, src_len as i64
 fn deflate_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
     _enc_init();
     _cl_init();
+    if (level <= 0) {
+        let is bitwriter.BitWriter as bw0;
+        bitwriter.bw_init(&bw0, out);
+        if (_deflate_stored(&bw0, src, src_len) < 0) { return errno.Z_OOM; }
+        if (bw0.err < 0) { return errno.Z_OOM; }
+        return out.len;
+    }
+    // build the compressed (fixed/dynamic) stream into a temp buffer
+    let is bytes.Bytes as tmp = bytes.bytes_new(256);
     let is bitwriter.BitWriter as bw;
-    bitwriter.bw_init(&bw, out);
+    bitwriter.bw_init(&bw, &tmp);
     let is i64 as r with mut = 0;
-    if (level <= 0) { r = _deflate_stored(&bw, src, src_len); }
-    else if (level >= 2) { r = _deflate_dynamic_entry(&bw, src, src_len); }
+    if (level >= 2) { r = _deflate_dynamic_entry(&bw, src, src_len); }
     else { r = _deflate_fixed(&bw, src, src_len); }
-    if (r < 0) { return r; }
-    if (bw.err < 0) { return errno.Z_OOM; }
+    if (r < 0 || bw.err < 0) { bytes.bytes_free(&tmp); return errno.Z_OOM; }
+    // stored-block size (5-byte header per <=65535-byte chunk)
+    let is i64 as nchunks with mut = (src_len + 65534) / 65535;
+    if (nchunks < 1) { nchunks = 1; }
+    let is i64 as storedSize = src_len + 5 * nchunks;
+    if (tmp.len <= storedSize) {
+        bytes.bytes_append(out, tmp.ptr, tmp.len);
+    } else {
+        let is bitwriter.BitWriter as bs;
+        bitwriter.bw_init(&bs, out);
+        if (_deflate_stored(&bs, src, src_len) < 0) { bytes.bytes_free(&tmp); return errno.Z_OOM; }
+        if (bs.err < 0) { bytes.bytes_free(&tmp); return errno.Z_OOM; }
+    }
+    bytes.bytes_free(&tmp);
     return out.len;
 }
