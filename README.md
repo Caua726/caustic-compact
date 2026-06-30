@@ -31,7 +31,7 @@ The whole library, decode and encode, is exercised by one test runner (itself a 
 
 This is an honest list of where it stops short of the reference implementations.
 
-- **zstd encode uses raw literals** — the LZ77 sequences are FSE-coded (real compression), but the literals are not yet Huffman-coded, so literal-heavy inputs lag the reference (≈2×) while match-heavy inputs are competitive (often within ~10%).
+- **zstd encode uses raw literals** — the LZ77 sequences are FSE-coded with cross-block matching, which is competitive with `zstd -19` on the test corpus (often within a few percent, sometimes smaller). Literals are not yet Huffman-coded, so inputs whose post-match literals are *both* large and low-entropy would lag; high-entropy literals (the common case) cost the same either way.
 - **brotli encode is store mode** — valid and tool-decodable, but does not actually compress. The real prefix-code/context encoder is not written.
 - **DEFLATE encode uses fixed Huffman only** — no dynamic Huffman and no stored-block fallback, so incompressible data grows a few percent.
 - **bzip2 encode uses two identical Huffman tables** instead of the reference's up-to-six (multi-block for inputs over 900 KB is supported).
