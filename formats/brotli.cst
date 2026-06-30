@@ -12,6 +12,7 @@
 // =======================================================
 
 use "../core/errno.cst" as errno;
+use "std/io.cst" as io;
 use "../core/bytes.cst" as bytes;
 use "std/mem.cst" only bins, core as mem;
 use "brotli_dict.cst" as bd;
@@ -1086,8 +1087,20 @@ fn _emit_clcl(w as *biw.BitWriter, v as i64) as void {
     else { biw.bw_bits(w, 15, 4); }
 }
 
-// Emit a complex Huffman code description for clen[0..nsym), no 16/17 RLE.
+// Emit a Huffman code description for clen[0..nsym). A single-symbol code is
+// incomplete as a complex code, so it must use the 1-symbol simple form.
 fn _emit_tree(w as *biw.BitWriter, clen as *i64, nsym as i64) as void {
+    let is i64 as nzc with mut = 0;
+    let is i64 as theSym with mut = 0;
+    let is i64 as q with mut = 0;
+    while (q < nsym) { if (clen[q] > 0) { nzc = nzc + 1; theSym = q; } q = q + 1; }
+    if (nzc == 1) {
+        let is i64 as maxBits = 1 + _log2floor(nsym - 1);
+        biw.bw_bits(w, 1, 2);                       // simpleCodeOrSkip = 1 (simple)
+        biw.bw_bits(w, 0, 2);                       // numSymbols-1 = 0 (1 symbol)
+        biw.bw_bits(w, theSym, maxBits);
+        return;
+    }
     biw.bw_bits(w, 0, 2);                          // simpleCodeOrSkip = 0 (complex, skip 0)
     let is i64 as lastNZ with mut = 0;
     let is i64 as i with mut = 0;
@@ -1224,7 +1237,7 @@ fn _brotli_huff(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) a
 // uncompressed (store) block, so output is never larger than store mode.
 fn brotli_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
     let is bytes.Bytes as huff = bytes.bytes_new(256);
-    _brotli_huff(src, src_len, &huff, level);
+    _brotli_huff2(src, src_len, &huff, level);
     let is bytes.Bytes as store = bytes.bytes_new(256);
     _brotli_store(src, src_len, &store, level);
     if (huff.len <= store.len) { bytes.bytes_append(out, huff.ptr, huff.len); }
@@ -1232,4 +1245,243 @@ fn brotli_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64
     bytes.bytes_free(&huff);
     bytes.bytes_free(&store);
     return out.len;
+}
+
+// ===================== BROTLI ENCODER phase 2 (matches) ================
+// Adds LZ77: insert-and-copy commands with explicit distances (codes 16+,
+// NPOSTFIX=0/NDIRECT=0, so the ring is never referenced), Huffman trees over
+// literals, commands and distances. WBITS=22 so distances reach 4 MB back.
+
+let is *i64 as _distOffE with mut;     // distOff[16..63]
+let is *i64 as _distExtE with mut;     // distExtra[16..63]
+
+fn _build_dist_lut() as void {
+    if (cast(i64, _distOffE) != 0) { return; }
+    _distOffE = _ia(64); _distExtE = _ia(64);
+    let is i64 as i with mut = 16;
+    let is i64 as bits with mut = 1;
+    let is i64 as half with mut = 0;
+    while (i < 64) {
+        let is i64 as base = ((2 + half) << bits) - 4 + 1;
+        _distExtE[i] = bits; _distOffE[i] = base;
+        i = i + 1; bits = bits + half; half = half ^ 1;
+    }
+}
+
+fn _dist_code(d as i64) as i64 {
+    let is i64 as c with mut = 16;
+    while (c < 63) {
+        if (_distOffE[c + 1] > d) { break; }
+        c = c + 1;
+    }
+    return c;
+}
+
+// command symbol for (insOffVal, cpyOffVal); needExplicit -> distCtx >= 0.
+fn _cmd_symbol(insOffVal as i64, cpyOffVal as i64, needExplicit as i64) as i64 {
+    let is i64 as c with mut = 0;
+    while (c < 704) {
+        if (CMD[c * 4 + 1] == insOffVal && CMD[c * 4 + 2] == cpyOffVal) {
+            if (needExplicit == 0 || CMD[c * 4 + 3] >= 0) { return c; }
+        }
+        c = c + 1;
+    }
+    return 0 - 1;
+}
+
+fn _nz_one(arr as *i64, n as i64) as i64 {
+    let is i64 as c with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) { if (arr[i] > 0) { c = c + 1; } i = i + 1; }
+    if (c == 1) { return 1; }
+    return 0;
+}
+
+fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    _tabs();
+    _build_dist_lut();
+    if (src_len < 16) { return _brotli_huff(src, src_len, out, level); }
+
+    // insert/copy offset tables
+    let is [24]i64 as insOff; let is [24]i64 as cpyOff;
+    insOff[0] = 0; cpyOff[0] = 2;
+    let is i64 as t with mut = 0;
+    while (t < 23) {
+        insOff[t + 1] = insOff[t] + (1 << INSNB[t]);
+        cpyOff[t + 1] = cpyOff[t] + (1 << CPYNB[t]);
+        t = t + 1;
+    }
+
+    // --- match finding -> command list (insRun, copyLen, dist) ---
+    let is i64 as HSIZE with imut = 65536;
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(HSIZE * 8));
+    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), HSIZE * 8);
+    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (src_len + 1) * 8);
+    let is i64 as maxCmd = src_len + 16;
+    let is *i64 as cmInsRun = _ia(maxCmd);
+    let is *i64 as cmCopy = _ia(maxCmd);
+    let is *i64 as cmDist = _ia(maxCmd);
+    let is i64 as ncmd with mut = 0;
+    let is *u8 as lits = mem.core.mmap_anon(src_len + 16);
+    let is i64 as nlit with mut = 0;
+
+    let is i64 as pos with mut = 0;
+    let is i64 as anchor with mut = 0;
+    while (pos + 4 <= src_len) {
+        let is i64 as h = ((cast(i64, src[pos]) << 11) ^ (cast(i64, src[pos + 1]) << 7)
+                          ^ (cast(i64, src[pos + 2]) << 3) ^ cast(i64, src[pos + 3])) & (HSIZE - 1);
+        let is i64 as cand with mut = head[h];
+        prev[pos] = cand; head[h] = pos;
+        let is i64 as bestLen with mut = 0;
+        let is i64 as bestDist with mut = 0;
+        let is i64 as chain with mut = 0;
+        while (cand >= 0) {
+            if (chain >= 128) { break; }
+            let is i64 as l with mut = 0;
+            while (pos + l < src_len) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
+            if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+            cand = prev[cand];
+            chain = chain + 1;
+        }
+        if (bestLen >= 4) {
+            let is i64 as insRun = pos - anchor;
+            let is i64 as a with mut = anchor;
+            while (a < pos) { lits[nlit] = src[a]; nlit = nlit + 1; a = a + 1; }
+            // (0,2) split: small insert + large copy has no command symbol
+            let is i64 as ccode = _copy_code_local(cpyOff, bestLen);
+            let is i64 as icode = _copy_code_local2(insOff, insRun);
+            if ((icode >> 3) == 0 && (ccode >> 3) == 2) {
+                cmInsRun[ncmd] = insRun; cmCopy[ncmd] = 69; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
+                let is i64 as rem with mut = bestLen - 69;
+                while (rem > 0) {
+                    let is i64 as cc with mut = rem;
+                    if (cc > 69) { cc = 69; }
+                    cmInsRun[ncmd] = 0; cmCopy[ncmd] = cc; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
+                    rem = rem - cc;
+                }
+            } else {
+                cmInsRun[ncmd] = insRun; cmCopy[ncmd] = bestLen; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
+            }
+            let is i64 as k with mut = 1;
+            while (k < bestLen) {
+                if (pos + k + 4 <= src_len) {
+                    let is i64 as hk = ((cast(i64, src[pos + k]) << 11) ^ (cast(i64, src[pos + k + 1]) << 7)
+                                       ^ (cast(i64, src[pos + k + 2]) << 3) ^ cast(i64, src[pos + k + 3])) & (HSIZE - 1);
+                    prev[pos + k] = head[hk]; head[hk] = pos + k;
+                }
+                k = k + 1;
+            }
+            pos = pos + bestLen; anchor = pos;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    // trailing literals -> final insert-only command (only if any remain)
+    if (src_len - anchor > 0) {
+        let is i64 as a2 with mut = anchor;
+        while (a2 < src_len) { lits[nlit] = src[a2]; nlit = nlit + 1; a2 = a2 + 1; }
+        cmInsRun[ncmd] = src_len - anchor; cmCopy[ncmd] = 0; cmDist[ncmd] = 0; ncmd = ncmd + 1;
+    }
+
+    // --- symbol frequencies ---
+    let is *i64 as cmdFreq = _ia(704);
+    let is *i64 as litFreq = _ia(256);
+    let is *i64 as distFreq = _ia(64);
+    let is i64 as ci with mut = 0;
+    while (ci < nlit) { litFreq[cast(i64, lits[ci])] = litFreq[cast(i64, lits[ci])] + 1; ci = ci + 1; }
+    ci = 0;
+    while (ci < ncmd) {
+        let is i64 as icode = _copy_code_local2(insOff, cmInsRun[ci]);
+        let is i64 as last with mut = 0; if (cmDist[ci] == 0 && cmCopy[ci] == 0) { last = 1; }
+        let is i64 as ccode with mut = 0;
+        if (last == 1) { ccode = 0; } else { ccode = _copy_code_local(cpyOff, cmCopy[ci]); }
+        let is i64 as needExp with mut = 1;
+        if (last == 1) { needExp = 0; }
+        let is i64 as cs = _cmd_symbol(insOff[icode], cpyOff[ccode], needExp);
+        cmdFreq[cs] = cmdFreq[cs] + 1;
+        if (last == 0) { distFreq[_dist_code(cmDist[ci])] = distFreq[_dist_code(cmDist[ci])] + 1; }
+        ci = ci + 1;
+    }
+
+    // --- build Huffman trees ---
+    let is *i64 as lclen = _ia(256); let is *i64 as lcode = _ia(256);
+    _bhlen(litFreq, 256, 15, lclen); _bhcodes(lclen, 256, lcode);
+    let is *i64 as cclen = _ia(704); let is *i64 as ccode2 = _ia(704);
+    _bhlen(cmdFreq, 704, 15, cclen); _bhcodes(cclen, 704, ccode2);
+    let is *i64 as dclen = _ia(64); let is *i64 as dcode = _ia(64);
+    _bhlen(distFreq, 64, 15, dclen); _bhcodes(dclen, 64, dcode);
+    // single-symbol trees: the decoder consumes 0 bits per symbol
+    let is i64 as litSingle = _nz_one(lclen, 256);
+    let is i64 as cmdSingle = _nz_one(cclen, 704);
+    let is i64 as distSingle = _nz_one(dclen, 64);
+
+    // --- emit meta-block ---
+    let is biw.BitWriter as w;
+    biw.bw_init(&w, out);
+    biw.bw_bits(&w, 1, 1); biw.bw_bits(&w, 5, 3);  // WBITS = 22
+    biw.bw_bits(&w, 1, 1); biw.bw_bits(&w, 0, 1);  // ISLAST=1, ISLASTEMPTY=0
+    let is i64 as mlen = src_len - 1;
+    let is i64 as nibbles with mut = 4;
+    while ((mlen >> (nibbles * 4)) != 0) { nibbles = nibbles + 1; }
+    biw.bw_bits(&w, nibbles - 4, 2);
+    let is i64 as kk with mut = 0;
+    while (kk < nibbles) { biw.bw_bits(&w, (mlen >> (4 * kk)) & 0xF, 4); kk = kk + 1; }
+    biw.bw_bits(&w, 0, 1); biw.bw_bits(&w, 0, 1); biw.bw_bits(&w, 0, 1);  // NBLTYPES L/I/D = 1
+    biw.bw_bits(&w, 0, 2); biw.bw_bits(&w, 0, 4);  // NPOSTFIX=0, NDIRECT=0
+    biw.bw_bits(&w, 0, 2);                          // context mode LSB6
+    biw.bw_bits(&w, 0, 1); biw.bw_bits(&w, 0, 1);  // NTREESL=1, NTREESD=1 (context maps)
+    _emit_tree(&w, lclen, 256);                     // literal tree
+    _emit_tree(&w, cclen, 704);                     // command tree
+    _emit_tree(&w, dclen, 64);                      // distance tree
+
+    // --- emit commands ---
+    let is i64 as litCursor with mut = 0;
+    ci = 0;
+    while (ci < ncmd) {
+        let is i64 as insRun = cmInsRun[ci];
+        let is i64 as last with mut = 0; if (cmDist[ci] == 0 && cmCopy[ci] == 0) { last = 1; }
+        let is i64 as icode = _copy_code_local2(insOff, insRun);
+        let is i64 as ccode with mut = 0;
+        if (last == 1) { ccode = 0; } else { ccode = _copy_code_local(cpyOff, cmCopy[ci]); }
+        let is i64 as needExp with mut = 1;
+        if (last == 1) { needExp = 0; }
+        let is i64 as cs = _cmd_symbol(insOff[icode], cpyOff[ccode], needExp);
+        if (cmdSingle == 0) { biw.bw_bits(&w, ccode2[cs], cclen[cs]); }   // command symbol
+        if (INSNB[icode] > 0) { biw.bw_bits(&w, insRun - insOff[icode], INSNB[icode]); }
+        if (CPYNB[ccode] > 0) {
+            let is i64 as cv with mut = 0;
+            if (last == 0) { cv = cmCopy[ci] - cpyOff[ccode]; }
+            biw.bw_bits(&w, cv, CPYNB[ccode]);
+        }
+        // literals
+        let is i64 as j with mut = 0;
+        while (j < insRun) {
+            let is i64 as lc = cast(i64, lits[litCursor]);
+            if (litSingle == 0) { biw.bw_bits(&w, lcode[lc], lclen[lc]); }
+            litCursor = litCursor + 1; j = j + 1;
+        }
+        // distance (intermediate commands only)
+        if (last == 0) {
+            let is i64 as ds = _dist_code(cmDist[ci]);
+            if (distSingle == 0) { biw.bw_bits(&w, dcode[ds], dclen[ds]); }
+            if (_distExtE[ds] > 0) { biw.bw_bits(&w, cmDist[ci] - _distOffE[ds], _distExtE[ds]); }
+        }
+        ci = ci + 1;
+    }
+    biw.bw_align(&w);
+    mem.core.munmap(cast(*u8, head), HSIZE * 8);
+    mem.core.munmap(cast(*u8, prev), (src_len + 1) * 8);
+    return out.len;
+}
+
+fn _copy_code_local(cpyOff as *i64, len as i64) as i64 {
+    let is i64 as c with mut = 0;
+    while (c < 23) { if (cpyOff[c + 1] > len) { break; } c = c + 1; }
+    return c;
+}
+fn _copy_code_local2(insOff as *i64, run as i64) as i64 {
+    let is i64 as c with mut = 0;
+    while (c < 23) { if (insOff[c + 1] > run) { break; } c = c + 1; }
+    return c;
 }
