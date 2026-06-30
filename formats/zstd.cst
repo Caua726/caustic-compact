@@ -611,7 +611,7 @@ fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
 }
 
 // ---- encode (raw blocks: valid, no compression) -----------------------
-fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+fn _zstd_compress_store(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
     bytes.bytes_push(out, cast(u8, 0x28));
     bytes.bytes_push(out, cast(u8, 0xB5));
     bytes.bytes_push(out, cast(u8, 0x2F));
@@ -636,6 +636,263 @@ fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
         bytes.bytes_push(out, cast(u8, (bh >> 16) & 0xFF));
         if (chunk > 0) { bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), chunk); }
         pos = pos + chunk;
+    }
+    return out.len;
+}
+
+// ===================== ZSTD ENTROPY ENCODER ============================
+// Compressed block: raw literals + FSE-coded sequences (predefined tables,
+// mode 0). The FSE encoder mirrors the educational decoder's convention:
+// state in [0,size); decoder transition u -> ns[u] + read(nb[u]). Offsets are
+// always encoded explicitly (rawoff = dist+3 > 3), so rep-codes never fire.
+let is *i64 as _llCmap with mut; let is *i64 as _llFirst with mut;
+let is *i64 as _ofCmap with mut; let is *i64 as _ofFirst with mut;
+let is *i64 as _mlCmap with mut; let is *i64 as _mlFirst with mut;
+let is i32 as _enc_ready with mut = 0;
+
+fn _build_cmap(t as *Fse, cmap as *i64, first as *i64, numSymbs as i64, size as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < numSymbs * size) { cmap[i] = 0 - 1; i = i + 1; }
+    i = 0; while (i < numSymbs) { first[i] = 0 - 1; i = i + 1; }
+    let is i64 as u with mut = 0;
+    while (u < size) {
+        let is i64 as sm = t.sym[u];
+        if (first[sm] < 0) { first[sm] = u; }
+        let is i64 as base = t.ns[u];
+        let is i64 as nb = t.nb[u];
+        let is i64 as cnt = 1 << nb;
+        let is i64 as b with mut = 0;
+        while (b < cnt) { cmap[sm * size + base + b] = u; b = b + 1; }
+        u = u + 1;
+    }
+}
+
+fn _enc_init() as void {
+    if (_enc_ready == 1) { return; }
+    _tabs();
+    _zalloc();
+    _fse_build(&_llT, LLD, 36, 6);
+    _fse_build(&_ofT, OFD, 29, 5);
+    _fse_build(&_mlT, MLD, 53, 6);
+    _llCmap = _ialloc(36 * 64); _llFirst = _ialloc(36); _build_cmap(&_llT, _llCmap, _llFirst, 36, 64);
+    _ofCmap = _ialloc(29 * 32); _ofFirst = _ialloc(29); _build_cmap(&_ofT, _ofCmap, _ofFirst, 29, 32);
+    _mlCmap = _ialloc(53 * 64); _mlFirst = _ialloc(53); _build_cmap(&_mlT, _mlCmap, _mlFirst, 53, 64);
+    _enc_ready = 1;
+}
+
+fn _ll_code(x as i64) as i64 {
+    let is i64 as c with mut = 0;
+    while (c < 35) { if (LLB[c + 1] > x) { break; } c = c + 1; }
+    return c;
+}
+fn _ml_code(x as i64) as i64 {
+    let is i64 as c with mut = 0;
+    while (c < 52) { if (MLB[c + 1] > x) { break; } c = c + 1; }
+    return c;
+}
+
+// forward LSB-first bit writer (matches _rdLE used by the backward reader)
+struct ZBW { buf as *u8; bitpos as i64; }
+fn _zbw_add(w as *ZBW, value as i64, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (((value >> i) & 1) == 1) {
+            let is i64 as bp = w.bitpos;
+            w.buf[bp >> 3] = cast(u8, cast(i64, w.buf[bp >> 3]) | (1 << (bp & 7)));
+        }
+        w.bitpos = w.bitpos + 1;
+        i = i + 1;
+    }
+}
+
+fn _emit_lit_header(blk as *bytes.Bytes, regSize as i64) as void {
+    if (regSize < 32) {
+        bytes.bytes_push(blk, cast(u8, regSize << 3));                        // raw, 1-byte
+    } else if (regSize < 4096) {
+        bytes.bytes_push(blk, cast(u8, 0x04 | ((regSize & 0xF) << 4)));       // raw, 2-byte
+        bytes.bytes_push(blk, cast(u8, (regSize >> 4) & 0xFF));
+    } else {
+        bytes.bytes_push(blk, cast(u8, 0x0C | ((regSize & 0xF) << 4)));       // raw, 3-byte
+        bytes.bytes_push(blk, cast(u8, (regSize >> 4) & 0xFF));
+        bytes.bytes_push(blk, cast(u8, (regSize >> 12) & 0xFF));
+    }
+}
+
+// Append the sequences section (count + modes=0 + FSE bitstream) to blk.
+fn _encode_seqs(llenA as *i64, mlenA as *i64, distA as *i64, nseq as i64, blk as *bytes.Bytes) as i64 {
+    let is *i64 as llC = _ialloc(nseq);
+    let is *i64 as mlC = _ialloc(nseq);
+    let is *i64 as ofC = _ialloc(nseq);
+    let is i64 as i with mut = 0;
+    while (i < nseq) {
+        llC[i] = _ll_code(llenA[i]);
+        mlC[i] = _ml_code(mlenA[i]);
+        ofC[i] = _highbit(distA[i] + 3);
+        i = i + 1;
+    }
+    let is *i64 as llS = _ialloc(nseq);
+    let is *i64 as mlS = _ialloc(nseq);
+    let is *i64 as ofS = _ialloc(nseq);
+    llS[nseq - 1] = _llFirst[llC[nseq - 1]];
+    mlS[nseq - 1] = _mlFirst[mlC[nseq - 1]];
+    ofS[nseq - 1] = _ofFirst[ofC[nseq - 1]];
+    i = nseq - 2;
+    while (i >= 0) {
+        llS[i] = _llCmap[llC[i] * 64 + llS[i + 1]];
+        mlS[i] = _mlCmap[mlC[i] * 64 + mlS[i + 1]];
+        ofS[i] = _ofCmap[ofC[i] * 32 + ofS[i + 1]];
+        i = i - 1;
+    }
+    let is i64 as bufcap = nseq * 24 + 64;
+    let is *u8 as bsbuf = mem.core.mmap_anon(bufcap);
+    mem.core.memset(bsbuf, cast(i32, 0), bufcap);
+    let is ZBW as w; w.buf = bsbuf; w.bitpos = 0;
+
+    let is i64 as L = nseq - 1;
+    _zbw_add(&w, llenA[L] - LLB[llC[L]], LLE[llC[L]]);
+    _zbw_add(&w, mlenA[L] - MLB[mlC[L]], MLE[mlC[L]]);
+    _zbw_add(&w, (distA[L] + 3) - (1 << ofC[L]), ofC[L]);
+    i = nseq - 2;
+    while (i >= 0) {
+        _zbw_add(&w, ofS[i + 1] - _ofT.ns[ofS[i]], _ofT.nb[ofS[i]]);
+        _zbw_add(&w, mlS[i + 1] - _mlT.ns[mlS[i]], _mlT.nb[mlS[i]]);
+        _zbw_add(&w, llS[i + 1] - _llT.ns[llS[i]], _llT.nb[llS[i]]);
+        _zbw_add(&w, llenA[i] - LLB[llC[i]], LLE[llC[i]]);
+        _zbw_add(&w, mlenA[i] - MLB[mlC[i]], MLE[mlC[i]]);
+        _zbw_add(&w, (distA[i] + 3) - (1 << ofC[i]), ofC[i]);
+        i = i - 1;
+    }
+    _zbw_add(&w, mlS[0], 6);
+    _zbw_add(&w, ofS[0], 5);
+    _zbw_add(&w, llS[0], 6);
+    _zbw_add(&w, 1, 1);                                  // end marker
+    let is i64 as nbytes = (w.bitpos + 7) >> 3;
+
+    // sequences header: count
+    if (nseq < 128) {
+        bytes.bytes_push(blk, cast(u8, nseq));
+    } else if (nseq < 0x7F00) {
+        bytes.bytes_push(blk, cast(u8, (nseq >> 8) + 128));
+        bytes.bytes_push(blk, cast(u8, nseq & 0xFF));
+    } else {
+        bytes.bytes_push(blk, cast(u8, 0xFF));
+        bytes.bytes_push(blk, cast(u8, (nseq - 0x7F00) & 0xFF));
+        bytes.bytes_push(blk, cast(u8, ((nseq - 0x7F00) >> 8) & 0xFF));
+    }
+    bytes.bytes_push(blk, cast(u8, 0));                  // modes: all predefined
+    bytes.bytes_append(blk, bsbuf, nbytes);
+
+    mem.core.munmap(bsbuf, bufcap);
+    return 0;
+}
+
+// Greedy hash-chain match finder over src[start, start+blen); fills the
+// sequence arrays and the literals buffer. Returns the sequence count.
+fn _find_sequences(src as *u8, start as i64, blen as i64, llenA as *i64, mlenA as *i64,
+                   distA as *i64, litbuf as *bytes.Bytes) as i64 {
+    let is i64 as HSIZE with imut = 32768;
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(HSIZE * 8));
+    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((blen + 1) * 8));
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), HSIZE * 8);
+    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (blen + 1) * 8);
+    let is i64 as nseq with mut = 0;
+    let is i64 as pos with mut = start;
+    let is i64 as anchor with mut = start;
+    let is i64 as end = start + blen;
+    while (pos + 3 <= end) {
+        let is i64 as h = ((cast(i64, src[pos]) << 10) ^ (cast(i64, src[pos + 1]) << 5)
+                          ^ cast(i64, src[pos + 2])) & (HSIZE - 1);
+        let is i64 as cand with mut = head[h];
+        prev[pos - start] = cand;
+        head[h] = pos;
+        let is i64 as bestLen with mut = 0;
+        let is i64 as bestDist with mut = 0;
+        let is i64 as chain with mut = 0;
+        while (cand >= start) {
+            if (chain >= 64) { break; }
+            let is i64 as l with mut = 0;
+            while (pos + l < end) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
+            if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+            cand = prev[cand - start];
+            chain = chain + 1;
+        }
+        if (bestLen >= 3) {
+            let is i64 as litRun = pos - anchor;
+            if (litRun > 0) { bytes.bytes_append(litbuf, cast(*u8, cast(i64, src) + anchor), litRun); }
+            llenA[nseq] = litRun; mlenA[nseq] = bestLen; distA[nseq] = bestDist;
+            nseq = nseq + 1;
+            let is i64 as k with mut = 1;
+            while (k < bestLen) {
+                if (pos + k + 3 <= end) {
+                    let is i64 as hk = ((cast(i64, src[pos + k]) << 10) ^ (cast(i64, src[pos + k + 1]) << 5)
+                                       ^ cast(i64, src[pos + k + 2])) & (HSIZE - 1);
+                    prev[pos + k - start] = head[hk];
+                    head[hk] = pos + k;
+                }
+                k = k + 1;
+            }
+            pos = pos + bestLen;
+            anchor = pos;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    if (anchor < end) { bytes.bytes_append(litbuf, cast(*u8, cast(i64, src) + anchor), end - anchor); }
+    mem.core.munmap(cast(*u8, head), HSIZE * 8);
+    mem.core.munmap(cast(*u8, prev), (blen + 1) * 8);
+    return nseq;
+}
+
+fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    _enc_init();
+    bytes.bytes_push(out, cast(u8, 0x28)); bytes.bytes_push(out, cast(u8, 0xB5));
+    bytes.bytes_push(out, cast(u8, 0x2F)); bytes.bytes_push(out, cast(u8, 0xFD));
+    bytes.bytes_push(out, cast(u8, 0xA0));   // single-segment, 4-byte FCS, no checksum
+    bytes.bytes_push(out, cast(u8, src_len & 0xFF));
+    bytes.bytes_push(out, cast(u8, (src_len >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (src_len >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (src_len >> 24) & 0xFF));
+
+    let is i64 as pos with mut = 0;
+    let is i64 as first with mut = 1;
+    while (pos < src_len || first == 1) {
+        first = 0;
+        let is i64 as blockSize with mut = src_len - pos;
+        if (blockSize > 131072) { blockSize = 131072; }
+        let is i64 as last with mut = 0;
+        if (pos + blockSize >= src_len) { last = 1; }
+
+        let is *i64 as llenA = _ialloc(blockSize + 1);
+        let is *i64 as mlenA = _ialloc(blockSize + 1);
+        let is *i64 as distA = _ialloc(blockSize + 1);
+        let is bytes.Bytes as litbuf = bytes.bytes_new(256);
+        let is i64 as nseq = _find_sequences(src, pos, blockSize, llenA, mlenA, distA, &litbuf);
+
+        let is bytes.Bytes as blk = bytes.bytes_new(256);
+        _emit_lit_header(&blk, litbuf.len);
+        if (litbuf.len > 0) { bytes.bytes_append(&blk, litbuf.ptr, litbuf.len); }
+        if (nseq == 0) { bytes.bytes_push(&blk, cast(u8, 0)); }
+        else { _encode_seqs(llenA, mlenA, distA, nseq, &blk); }
+
+        if (blk.len < blockSize && blk.len <= 2097151) {
+            let is i64 as bh = last | (2 << 1) | (blk.len << 3);
+            bytes.bytes_push(out, cast(u8, bh & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bh >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bh >> 16) & 0xFF));
+            bytes.bytes_append(out, blk.ptr, blk.len);
+        } else {
+            let is i64 as bh = last | (blockSize << 3);
+            bytes.bytes_push(out, cast(u8, bh & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bh >> 8) & 0xFF));
+            bytes.bytes_push(out, cast(u8, (bh >> 16) & 0xFF));
+            if (blockSize > 0) { bytes.bytes_append(out, cast(*u8, cast(i64, src) + pos), blockSize); }
+        }
+        bytes.bytes_free(&blk);
+        bytes.bytes_free(&litbuf);
+        mem.core.munmap(cast(*u8, llenA), (blockSize + 1) * 8);
+        mem.core.munmap(cast(*u8, mlenA), (blockSize + 1) * 8);
+        mem.core.munmap(cast(*u8, distA), (blockSize + 1) * 8);
+        pos = pos + blockSize;
     }
     return out.len;
 }
