@@ -150,12 +150,12 @@ fn xxhash32(buf as *u8, len as i64) as i64 {
 // Implemented entirely in u64 because i64 sign-extends on >> and the
 // xxh64 algorithm legitimately produces values with the high bit set.
 fn _u64_cast(x as i64) as u64 { return cast(u64, x); }
-fn _u64_add(a as u64, b as u64) as u64 { return cast(u64, cast(i64, a) + cast(i64, b)); }
-fn _u64_xor(a as u64, b as u64) as u64 { return cast(u64, cast(i64, a) ^ cast(i64, b)); }
-fn _u64_or(a as u64, b as u64) as u64 { return cast(u64, cast(i64, a) | cast(i64, b)); }
-fn _u64_shl(a as u64, n as i64) as u64 { return cast(u64, cast(i64, a) << n); }
-fn _u64_shr(a as u64, n as i64) as u64 { return cast(u64, cast(i64, a) >> n); }
-fn _u64_mul(a as u64, b as u64) as u64 { return cast(u64, cast(i64, a) * cast(i64, b)); }
+fn _u64_add(a as u64, b as u64) as u64 { return a + b; }
+fn _u64_xor(a as u64, b as u64) as u64 { return a ^ b; }
+fn _u64_or(a as u64, b as u64) as u64 { return a | b; }
+fn _u64_shl(a as u64, n as i64) as u64 { return a << cast(u64, n); }
+fn _u64_shr(a as u64, n as i64) as u64 { return a >> cast(u64, n); }   // logical for u64
+fn _u64_mul(a as u64, b as u64) as u64 { return a * b; }
 
 fn _rotl64u(a as u64, r as i64) as u64 {
     let is u64 as xl = _u64_shl(a, r);
@@ -178,37 +178,45 @@ fn _xx64_rdu32(buf as *u8, off as i64) as u64 {
         | (cast(i64, buf[off + 2]) << 16)
         | (cast(i64, buf[off + 3]) << 24));
 }
+// PRIME64_1..5
+fn _XXP64_1() as u64 { return cast(u64, cast(i64, 11400714785074694791)); }
+fn _XXP64_2() as u64 { return cast(u64, cast(i64, 14029467366897019727)); }
+fn _XXP64_3() as u64 { return cast(u64, cast(i64, 1609587929392839161)); }
+fn _XXP64_4() as u64 { return cast(u64, cast(i64, 9650029242287828579)); }
+fn _XXP64_5() as u64 { return cast(u64, cast(i64, 2870177450012600261)); }
+
 fn _xx64_roundu(acc as u64, input as u64) as u64 {
-    let is u64 as a with mut = _u64_add(acc, _u64_mul(input, cast(u64, cast(i64, 14029467366897019727))));
+    let is u64 as a with mut = _u64_add(acc, _u64_mul(input, _XXP64_2()));
     a = _rotl64u(a, 31);
-    return _u64_mul(a, cast(u64, cast(i64, 11400714785074694791)));
+    return _u64_mul(a, _XXP64_1());
 }
 fn _xx64_mergeRoundu(acc as u64, val as u64) as u64 {
     let is u64 as a = _u64_xor(acc, _xx64_roundu(cast(u64, 0), val));
-    return _u64_mul(a, cast(u64, cast(i64, 6983438078262162902)));   // P1 + PRIME64_2
+    return _u64_add(_u64_mul(a, _XXP64_1()), _XXP64_4());
 }
 fn _xx64_finalizeu(h as u64, buf as *u8, off as i64, len as i64) as u64 {
     let is u64 as hv with mut = h;
     let is i64 as p with mut = 0;
     while (p + 8 <= len) {
-        let is u64 as k1 = _xx64_rd64u(buf, off + p);
-        hv = _xx64_mergeRoundu(hv, k1);
+        let is u64 as k1 = _xx64_roundu(cast(u64, 0), _xx64_rd64u(buf, off + p));
+        hv = _u64_xor(hv, k1);
+        hv = _u64_add(_u64_mul(_rotl64u(hv, 27), _XXP64_1()), _XXP64_4());
         p = p + 8;
     }
     if (p + 4 <= len) {
-        let is u64 as k1 = _xx64_rdu32(buf, off + p);
-        hv = _xx64_mergeRoundu(hv, k1);
+        hv = _u64_xor(hv, _u64_mul(_xx64_rdu32(buf, off + p), _XXP64_1()));
+        hv = _u64_add(_u64_mul(_rotl64u(hv, 23), _XXP64_2()), _XXP64_3());
         p = p + 4;
     }
     while (p < len) {
-        let is u64 as k1 = cast(u64, cast(i64, buf[off + p]));
-        hv = _xx64_mergeRoundu(hv, k1);
+        hv = _u64_xor(hv, _u64_mul(cast(u64, cast(i64, buf[off + p])), _XXP64_5()));
+        hv = _u64_mul(_rotl64u(hv, 11), _XXP64_1());
         p = p + 1;
     }
     let is u64 as r with mut = _u64_xor(hv, _u64_shr(hv, 33));
-    r = _u64_mul(r, cast(u64, cast(i64, 14029467366897019727)));
+    r = _u64_mul(r, _XXP64_2());
     r = _u64_xor(r, _u64_shr(r, 29));
-    r = _u64_mul(r, cast(u64, cast(i64, 1609587929392839161)));
+    r = _u64_mul(r, _XXP64_3());
     r = _u64_xor(r, _u64_shr(r, 32));
     return r;
 }
@@ -216,10 +224,11 @@ fn xxhash64(buf as *u8, len as i64) as i64 {
     let is i64 as p with mut = 0;
     let is u64 as h with mut = 0;
     if (len >= 32) {
-        let is u64 as v1 with mut = _u64_add(cast(u64, cast(i64, 11400714785074694791)), cast(u64, cast(i64, 14029467366897019727)));
-        let is u64 as v2 with mut = cast(u64, cast(i64, 14029467366897019727));
+        let is u64 as v1 with mut = _u64_add(_XXP64_1(), _XXP64_2());
+        let is u64 as v2 with mut = _XXP64_2();
         let is u64 as v3 with mut = cast(u64, 0);
-        let is u64 as v4 with mut = _u64_shl(cast(u64, 0 - cast(i64, 11400714785074694791)), 0);
+        let is u64 as v4 with mut = _u64_xor(cast(u64, 0), _XXP64_1());   // 0 - P1 == 0 ^ ... no; use subtraction
+        v4 = cast(u64, cast(i64, 0) - cast(i64, 11400714785074694791));
         let is i64 as limit = len - 32;
         while (p <= limit) {
             v1 = _xx64_roundu(v1, _xx64_rd64u(buf, p)); p = p + 8;
@@ -229,9 +238,12 @@ fn xxhash64(buf as *u8, len as i64) as i64 {
         }
         h = _u64_add(_u64_add(_rotl64u(v1, 1), _rotl64u(v2, 7)),
             _u64_add(_rotl64u(v3, 12), _rotl64u(v4, 18)));
-        h = _xx64_mergeRoundu(h, cast(u64, cast(i64, 14029467366897019727)));
+        h = _xx64_mergeRoundu(h, v1);
+        h = _xx64_mergeRoundu(h, v2);
+        h = _xx64_mergeRoundu(h, v3);
+        h = _xx64_mergeRoundu(h, v4);
     } else {
-        h = _u64_add(cast(u64, cast(i64, 2870177450012600261)), cast(u64, cast(i64, 11400714785074694791)));
+        h = _XXP64_5();
     }
     h = _u64_add(h, cast(u64, len));
     return cast(i64, _xx64_finalizeu(h, buf, p, len - p));

@@ -11,6 +11,7 @@
 
 use "../core/errno.cst" as errno;
 use "../core/bytes.cst" as bytes;
+use "../core/checksum.cst" as checksum;
 use "std/mem.cst" only bins, core as mem;
 
 // ---- forward (LSB-first) input stream ---------------------------------
@@ -607,6 +608,12 @@ fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
             return errno.Z_BADTYPE;
         }
     }
+    if (checksumFlag == 1) {
+        if ((s.bit & 7) != 0) { s.off = s.off + 1; s.bit = 0; }
+        let is i64 as want = _iread(&s, 32) & 0xFFFFFFFF;
+        let is i64 as got = checksum.xxhash64(out.ptr, out.len) & 0xFFFFFFFF;
+        if (got != want) { return errno.Z_BADSUM; }
+    }
     return out.len;
 }
 
@@ -842,7 +849,7 @@ fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
     _enc_init();
     bytes.bytes_push(out, cast(u8, 0x28)); bytes.bytes_push(out, cast(u8, 0xB5));
     bytes.bytes_push(out, cast(u8, 0x2F)); bytes.bytes_push(out, cast(u8, 0xFD));
-    bytes.bytes_push(out, cast(u8, 0xA0));   // single-segment, 4-byte FCS, no checksum
+    bytes.bytes_push(out, cast(u8, 0xA4));   // single-segment, 4-byte FCS, content checksum
     bytes.bytes_push(out, cast(u8, src_len & 0xFF));
     bytes.bytes_push(out, cast(u8, (src_len >> 8) & 0xFF));
     bytes.bytes_push(out, cast(u8, (src_len >> 16) & 0xFF));
@@ -897,5 +904,11 @@ fn zstd_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
     }
     mem.core.munmap(cast(*u8, head), HSIZE * 8);
     mem.core.munmap(cast(*u8, prev), (src_len + 1) * 8);
+    // content checksum: low 32 bits of XXH64(content, seed 0), little-endian
+    let is i64 as ck = checksum.xxhash64(src, src_len) & 0xFFFFFFFF;
+    bytes.bytes_push(out, cast(u8, ck & 0xFF));
+    bytes.bytes_push(out, cast(u8, (ck >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (ck >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (ck >> 24) & 0xFF));
     return out.len;
 }
