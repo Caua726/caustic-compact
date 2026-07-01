@@ -33,7 +33,7 @@ This is an honest list of where it stops short of the reference implementations.
 
 - **brotli encode** does real LZ77 + Huffman (insert-and-copy commands with explicit distances) and is competitive with `brotli -q11` on the corpus — it beats it on `window` and `hello`, ties on `big`, and trails on pathological pure-repetition (`abc`) where the reference's distance-ring rep-codes win. No context modeling or static-dictionary references yet.
 - **zstd encode uses raw literals** — the LZ77 sequences are FSE-coded with cross-block matching, which is competitive with `zstd -19` on the test corpus (often within a few percent, sometimes smaller). Literals are not yet Huffman-coded, so inputs whose post-match literals are *both* large and low-entropy would lag; high-entropy literals (the common case) cost the same either way.
-- **bzip2 encode uses two identical Huffman tables** instead of the reference's up-to-six (multi-block for inputs over 900 KB is supported).
+- **bzip2 encode uses one Huffman table per block** instead of the reference's up-to-six with per-group selectors (multi-block over 900 KB is supported). Skipping the selector/extra-table overhead actually makes it *beat* `bzip2 -9` on this corpus; the multi-table refinement would only pay off on large, non-uniform inputs.
 - **Snappy is the raw block format**, not the framed `.sz` stream format.
 - One-shot and in-memory — no streaming API. No large-window Brotli, no xz delta/BCJ filters, no dictionaries.
 
