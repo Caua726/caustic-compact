@@ -1345,24 +1345,23 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
             chain = chain + 1;
         }
         if (bestLen >= 4) {
-            let is i64 as insRun = pos - anchor;
+            let is i64 as insRun with mut = pos - anchor;
             let is i64 as a with mut = anchor;
             while (a < pos) { lits[nlit] = src[a]; nlit = nlit + 1; a = a + 1; }
-            // (0,2) split: small insert + large copy has no command symbol
-            let is i64 as ccode = _copy_code_local(cpyOff, bestLen);
+            let is i64 as copyLen with mut = bestLen;
+            // (insHigh=0, cpyHigh=2) has no command symbol: extend the insert to
+            // 10 (insHigh=1) by emitting the first match bytes as literals, so a
+            // single insert-and-copy command covers the whole match.
+            let is i64 as ccode = _copy_code_local(cpyOff, copyLen);
             let is i64 as icode = _copy_code_local2(insOff, insRun);
             if ((icode >> 3) == 0 && (ccode >> 3) == 2) {
-                cmInsRun[ncmd] = insRun; cmCopy[ncmd] = 69; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
-                let is i64 as rem with mut = bestLen - 69;
-                while (rem > 0) {
-                    let is i64 as cc with mut = rem;
-                    if (cc > 69) { cc = 69; }
-                    cmInsRun[ncmd] = 0; cmCopy[ncmd] = cc; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
-                    rem = rem - cc;
-                }
-            } else {
-                cmInsRun[ncmd] = insRun; cmCopy[ncmd] = bestLen; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
+                let is i64 as need = 10 - insRun;
+                let is i64 as b with mut = pos;
+                let is i64 as kk with mut = 0;
+                while (kk < need) { lits[nlit] = src[b]; nlit = nlit + 1; b = b + 1; kk = kk + 1; }
+                insRun = 10; copyLen = copyLen - need;
             }
+            cmInsRun[ncmd] = insRun; cmCopy[ncmd] = copyLen; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
             let is i64 as k with mut = 1;
             while (k < bestLen) {
                 if (pos + k + 4 <= src_len) {
@@ -1391,6 +1390,7 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
     let is i64 as ci with mut = 0;
     while (ci < nlit) { litFreq[cast(i64, lits[ci])] = litFreq[cast(i64, lits[ci])] + 1; ci = ci + 1; }
     ci = 0;
+    let is i64 as lastDist with mut = 0;
     while (ci < ncmd) {
         let is i64 as icode = _copy_code_local2(insOff, cmInsRun[ci]);
         let is i64 as last with mut = 0; if (cmDist[ci] == 0 && cmCopy[ci] == 0) { last = 1; }
@@ -1400,7 +1400,12 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
         if (last == 1) { needExp = 0; }
         let is i64 as cs = _cmd_symbol(insOff[icode], cpyOff[ccode], needExp);
         cmdFreq[cs] = cmdFreq[cs] + 1;
-        if (last == 0) { distFreq[_dist_code(cmDist[ci])] = distFreq[_dist_code(cmDist[ci])] + 1; }
+        if (last == 0) {
+            let is i64 as ds with mut = 0;
+            if (cmDist[ci] == lastDist) { ds = 0; }              // rep0: reuse last distance
+            else { ds = _dist_code(cmDist[ci]); lastDist = cmDist[ci]; }
+            distFreq[ds] = distFreq[ds] + 1;
+        }
         ci = ci + 1;
     }
 
@@ -1437,6 +1442,7 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
 
     // --- emit commands ---
     let is i64 as litCursor with mut = 0;
+    let is i64 as lastDistE with mut = 0;
     ci = 0;
     while (ci < ncmd) {
         let is i64 as insRun = cmInsRun[ci];
@@ -1461,11 +1467,13 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
             if (litSingle == 0) { biw.bw_bits(&w, lcode[lc], lclen[lc]); }
             litCursor = litCursor + 1; j = j + 1;
         }
-        // distance (intermediate commands only)
+        // distance (intermediate commands only); rep0 when unchanged
         if (last == 0) {
-            let is i64 as ds = _dist_code(cmDist[ci]);
+            let is i64 as ds with mut = 0;
+            if (cmDist[ci] == lastDistE) { ds = 0; }
+            else { ds = _dist_code(cmDist[ci]); lastDistE = cmDist[ci]; }
             if (distSingle == 0) { biw.bw_bits(&w, dcode[ds], dclen[ds]); }
-            if (_distExtE[ds] > 0) { biw.bw_bits(&w, cmDist[ci] - _distOffE[ds], _distExtE[ds]); }
+            if (ds >= 16) { if (_distExtE[ds] > 0) { biw.bw_bits(&w, cmDist[ci] - _distOffE[ds], _distExtE[ds]); } }
         }
         ci = ci + 1;
     }
