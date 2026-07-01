@@ -510,6 +510,18 @@ fn _find_match(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64 {
     return bestLen;
 }
 
+// Match length at pos for a given back-distance (a repeated distance).
+fn _rep_len(src as *u8, pos as i64, slen as i64, dist as i64) as i64 {
+    let is i64 as maxLen with mut = slen - pos;
+    if (maxLen > 273) { maxLen = 273; }
+    let is i64 as l with mut = 0;
+    while (l < maxLen) {
+        if (src[pos - dist + l] != src[pos + l]) { break; }
+        l = l + 1;
+    }
+    return l;
+}
+
 // Encode raw LZMA into out (props lc=3 lp=0 pb=2). Known-size, no end marker.
 fn _lzma_encode(lz as *Lzma, src as *u8, slen as i64, out as *bytes.Bytes) as i64 {
     _ehead = cast(*i64, mem.core.mmap_anon(1048576 * 8));
@@ -519,35 +531,81 @@ fn _lzma_encode(lz as *Lzma, src as *u8, slen as i64, out as *bytes.Bytes) as i6
     let is i64 as pos with mut = 0;
     while (pos < slen) {
         let is i64 as posState = pos & (lz.numPosStates - 1);
+        // best repeated-distance match (rep0..rep3, length >= 2)
+        let is i64 as bestRepLen with mut = 0;
+        let is i64 as bestRepIdx with mut = 0;
+        let is i64 as ri with mut = 0;
+        while (ri < 4) {
+            let is i64 as rd with mut = 0;
+            if (ri == 0) { rd = lz.rep0 + 1; }
+            else if (ri == 1) { rd = lz.rep1 + 1; }
+            else if (ri == 2) { rd = lz.rep2 + 1; }
+            else { rd = lz.rep3 + 1; }
+            if (pos >= rd) {
+                let is i64 as rl = _rep_len(src, pos, slen, rd);
+                if (rl >= 2 && rl > bestRepLen) { bestRepLen = rl; bestRepIdx = ri; }
+            }
+            ri = ri + 1;
+        }
         let is i64 as dist with mut = 0;
         let is i64 as mlen with mut = _find_match(src, pos, slen, &dist);
-        if (mlen >= 2 && (mlen >= 3 || dist < 512)) {
+        let is i64 as choice with mut = 0;   // 0=literal 1=fresh-match 2=rep-match
+        if (bestRepLen >= 2 && mlen < bestRepLen + 2) { choice = 2; }
+        else if (mlen >= 2 && (mlen >= 3 || dist < 512)) { choice = 1; }
+        let is i64 as advLen with mut = 1;
+        if (choice == 2) {
+            _enc_bit(lz, lz.o_isMatch + (lz.state << 4) + posState, 1);
+            _enc_bit(lz, lz.o_isRep + lz.state, 1);
+            if (bestRepIdx == 0) {
+                _enc_bit(lz, lz.o_isRepG0 + lz.state, 0);
+                _enc_bit(lz, lz.o_isRep0Long + (lz.state << 4) + posState, 1);
+            } else {
+                _enc_bit(lz, lz.o_isRepG0 + lz.state, 1);
+                let is i64 as d with mut = 0;
+                if (bestRepIdx == 1) {
+                    _enc_bit(lz, lz.o_isRepG1 + lz.state, 0);
+                    d = lz.rep1; lz.rep1 = lz.rep0; lz.rep0 = d;
+                } else if (bestRepIdx == 2) {
+                    _enc_bit(lz, lz.o_isRepG1 + lz.state, 1);
+                    _enc_bit(lz, lz.o_isRepG2 + lz.state, 0);
+                    d = lz.rep2; lz.rep2 = lz.rep1; lz.rep1 = lz.rep0; lz.rep0 = d;
+                } else {
+                    _enc_bit(lz, lz.o_isRepG1 + lz.state, 1);
+                    _enc_bit(lz, lz.o_isRepG2 + lz.state, 1);
+                    d = lz.rep3; lz.rep3 = lz.rep2; lz.rep2 = lz.rep1; lz.rep1 = lz.rep0; lz.rep0 = d;
+                }
+            }
+            _enc_len(lz, 1, posState, bestRepLen - 2);
+            if (lz.state < 7) { lz.state = 8; } else { lz.state = 11; }
+            advLen = bestRepLen;
+        } else if (choice == 1) {
             _enc_bit(lz, lz.o_isMatch + (lz.state << 4) + posState, 1);
             _enc_bit(lz, lz.o_isRep + lz.state, 0);
             lz.rep3 = lz.rep2; lz.rep2 = lz.rep1; lz.rep1 = lz.rep0; lz.rep0 = dist - 1;
             _enc_len(lz, 0, posState, mlen - 2);
             _enc_distance(lz, mlen - 2, dist - 1);
             if (lz.state < 7) { lz.state = 7; } else { lz.state = 10; }
-            // insert hash entries for the matched span
-            let is i64 as k with mut = 1;
-            while (k < mlen) {
-                if (pos + k + 2 < slen) {
-                    let is i64 as hh = ((cast(i64, src[pos + k]) << 16) ^ (cast(i64, src[pos + k + 1]) << 8)
-                                       ^ cast(i64, src[pos + k + 2])) & 0xFFFFF;
-                    _eprev[(pos + k) & 0xFFFFF] = _ehead[hh];
-                    _ehead[hh] = pos + k;
-                }
-                k = k + 1;
-            }
-            pos = pos + mlen;
+            advLen = mlen;
         } else {
             _enc_bit(lz, lz.o_isMatch + (lz.state << 4) + posState, 0);
             _enc_literal(lz, src, pos);
             if (lz.state < 4) { lz.state = 0; }
             else if (lz.state < 10) { lz.state = lz.state - 3; }
             else { lz.state = lz.state - 6; }
-            pos = pos + 1;
+            advLen = 1;
         }
+        // insert hash entries for the consumed span (pos itself done by _find_match)
+        let is i64 as k with mut = 1;
+        while (k < advLen) {
+            if (pos + k + 2 < slen) {
+                let is i64 as hh = ((cast(i64, src[pos + k]) << 16) ^ (cast(i64, src[pos + k + 1]) << 8)
+                                   ^ cast(i64, src[pos + k + 2])) & 0xFFFFF;
+                _eprev[(pos + k) & 0xFFFFF] = _ehead[hh];
+                _ehead[hh] = pos + k;
+            }
+            k = k + 1;
+        }
+        pos = pos + advLen;
     }
     // flush range encoder
     let is i64 as f with mut = 0;
