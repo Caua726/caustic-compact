@@ -12,7 +12,6 @@
 // =======================================================
 
 use "../core/errno.cst" as errno;
-use "std/io.cst" as io;
 use "../core/bytes.cst" as bytes;
 use "std/mem.cst" only bins, core as mem;
 use "brotli_dict.cst" as bd;
@@ -345,6 +344,7 @@ let is *i64 as _distGroup with mut;
 let is *i64 as _blockTrees with mut;
 let is i64 as _npostfix with mut;
 let is i64 as _ndirect with mut;
+let is i64 as _largeWindow with mut = 0;
 let is *i64 as _distExtra with mut;
 let is *i64 as _distOff with mut;
 let is i64 as _maxBackward with mut;
@@ -365,7 +365,13 @@ fn _decodeWindowBits() as i64 {
     if (n != 0) { return 17 + n; }
     n = _take(3);
     if (n != 0) {
-        if (n == 1) { return 0 - 1; }   // large-window: unsupported
+        if (n == 1) {                    // large-window: 1 reserved bit + 6-bit size
+            if (_take(1) != 0) { return 0 - 1; }
+            let is i64 as lw = _take(6);
+            if (lw < 10 || lw > 30) { return 0 - 1; }
+            _largeWindow = 1;
+            return lw;
+        }
         return 8 + n;
     }
     return 17;
@@ -703,7 +709,9 @@ fn _readMetablockHuffman() as i64 {
     _cmdGroup = _ia(_treeGroupAllocSize(704, _numCmdTypes));
     let is i64 as r2 = _decodeTreeGroup(_cmdGroup, 704, 704, _numCmdTypes);
     if (r2 < 0) { return r2; }
-    let is i64 as distAlpha = 16 + _ndirect + 2 * (24 << _npostfix);
+    let is i64 as maxDbits with mut = 24;
+    if (_largeWindow == 1) { maxDbits = 62; }
+    let is i64 as distAlpha = 16 + _ndirect + 2 * (maxDbits << _npostfix);
     _distGroup = _ia(_treeGroupAllocSize(distAlpha, numDistTrees));
     let is i64 as r3 = _decodeTreeGroup(_distGroup, distAlpha, distAlpha, numDistTrees);
     if (r3 < 0) { return r3; }
@@ -781,7 +789,7 @@ fn brotli_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
     _tabs();
     _huf_alloc();
     _src = src; _slen = src_len; _bitp = 0;
-    _inputEnd = 0; _isUncompressed = 0; _isMetadata = 0; _mbLen = 0;
+    _inputEnd = 0; _isUncompressed = 0; _isMetadata = 0; _mbLen = 0; _largeWindow = 0;
 
     _blockTrees = _ia(3120);
     _blockTrees[0] = 7;
