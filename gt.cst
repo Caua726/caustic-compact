@@ -1,0 +1,18 @@
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" only bins, core as mem;
+use "./core/bytes.cst" as bytes;
+use "./formats/gzip.cst" as gzip;
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as path = env.argv(1);
+    let is i64 as sz = io.file_size(path);
+    let is *u8 as buf = mem.core.mmap_anon(sz + 8);
+    let is i64 as fd = io._open_read(path); let is i64 as g with mut = 0;
+    if (sz > 0) { g = io.read_exact(fd, buf, sz); } io._close_fd(fd);
+    let is bytes.Bytes as dec = bytes.bytes_new(256);
+    let is i64 as r = gzip.gzip_decompress(buf, sz, &dec);
+    if (r < 0) { io.printf("FAIL r=%ld\n", r); return 1; }
+    io.write_bytes(io.STDOUT, dec.ptr, dec.len);
+    return 0;
+}

@@ -18,14 +18,17 @@ fn _le32(p as *u8, off as i64) as i64 {
          | (cast(i64, p[off + 2]) << 16) | (cast(i64, p[off + 3]) << 24);
 }
 
-fn gzip_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
-    if (src_len < 18) { return errno.Z_BADHDR; }
-    if (cast(i64, src[0]) != 0x1F) { return errno.Z_BADHDR; }
-    if (cast(i64, src[1]) != 0x8B) { return errno.Z_BADHDR; }
-    if (cast(i64, src[2]) != 8) { return errno.Z_BADHDR; }     // CM must be deflate
-    let is i64 as flg = cast(i64, src[3]);
+// Decode one gzip member starting at src[base]. Appends its output to `out`,
+// verifies FHCRC/CRC-32/ISIZE, and returns the offset just past this member's
+// trailer (or a negative error).
+fn _gzip_member(src as *u8, src_len as i64, base as i64, out as *bytes.Bytes) as i64 {
+    if (base + 18 > src_len) { return errno.Z_BADHDR; }
+    if (cast(i64, src[base]) != 0x1F) { return errno.Z_BADHDR; }
+    if (cast(i64, src[base + 1]) != 0x8B) { return errno.Z_BADHDR; }
+    if (cast(i64, src[base + 2]) != 8) { return errno.Z_BADHDR; }   // CM must be deflate
+    let is i64 as flg = cast(i64, src[base + 3]);
 
-    let is i64 as pos with mut = 10;   // skip MTIME(4) + XFL(1) + OS(1)
+    let is i64 as pos with mut = base + 10;   // skip MTIME(4) + XFL(1) + OS(1)
 
     if ((flg & 4) != 0) {              // FEXTRA: 2-byte length + payload
         if (pos + 2 > src_len) { return errno.Z_BADHDR; }
@@ -33,34 +36,55 @@ fn gzip_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         pos = pos + 2 + xlen;
     }
     if ((flg & 8) != 0) {              // FNAME: zero-terminated
-        while (pos < src_len) {
-            let is i64 as c = cast(i64, src[pos]);
-            pos = pos + 1;
-            if (c == 0) { break; }
-        }
+        while (pos < src_len) { let is i64 as c = cast(i64, src[pos]); pos = pos + 1; if (c == 0) { break; } }
     }
     if ((flg & 16) != 0) {             // FCOMMENT: zero-terminated
-        while (pos < src_len) {
-            let is i64 as c = cast(i64, src[pos]);
-            pos = pos + 1;
-            if (c == 0) { break; }
-        }
+        while (pos < src_len) { let is i64 as c = cast(i64, src[pos]); pos = pos + 1; if (c == 0) { break; } }
     }
-    if ((flg & 2) != 0) {              // FHCRC: 2-byte header CRC (skip)
+    if ((flg & 2) != 0) {              // FHCRC: 2-byte CRC-16 of the header so far
+        if (pos + 2 > src_len) { return errno.Z_BADHDR; }
+        let is i64 as hcrc = cast(i64, src[pos]) | (cast(i64, src[pos + 1]) << 8);
+        if ((checksum.crc32(cast(*u8, cast(i64, src) + base), pos - base) & 0xFFFF) != hcrc) {
+            return errno.Z_BADSUM;
+        }
         pos = pos + 2;
     }
     if (pos > src_len - 8) { return errno.Z_BADHDR; }
 
+    let is i64 as memberStart = out.len;
     let is *u8 as body = cast(*u8, cast(i64, src) + pos);
     let is i64 as body_len = src_len - 8 - pos;
-    let is i64 as r = inflate.inflate(body, body_len, out);
+    let is i64 as consumed with mut = 0;
+    let is i64 as r = inflate.inflate2(body, body_len, out, &consumed);
     if (r < 0) { return r; }
 
-    let is i64 as stored_crc = _le32(src, src_len - 8);
-    let is i64 as stored_isize = _le32(src, src_len - 4);
-    let is i64 as got_crc = checksum.crc32(out.ptr, out.len);
+    let is i64 as trailer = pos + consumed;
+    if (trailer + 8 > src_len) { return errno.Z_BADHDR; }
+    let is i64 as stored_crc = _le32(src, trailer);
+    let is i64 as stored_isize = _le32(src, trailer + 4);
+    let is i64 as memberLen = out.len - memberStart;
+    let is i64 as got_crc = checksum.crc32(cast(*u8, cast(i64, out.ptr) + memberStart), memberLen);
     if (got_crc != stored_crc) { return errno.Z_BADSUM; }
-    if ((out.len & 0xFFFFFFFF) != stored_isize) { return errno.Z_BADSUM; }
+    if ((memberLen & 0xFFFFFFFF) != stored_isize) { return errno.Z_BADSUM; }
+    return trailer + 8;
+}
+
+fn gzip_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    let is i64 as pos with mut = 0;
+    while (pos < src_len) {
+        // skip inter-member NUL padding some tools emit
+        while (pos < src_len && cast(i64, src[pos]) == 0) { pos = pos + 1; }
+        if (pos >= src_len) { break; }
+        // stop cleanly if what's left is not another gzip member
+        if (pos + 2 > src_len) { break; }
+        if (cast(i64, src[pos]) != 0x1F || cast(i64, src[pos + 1]) != 0x8B) {
+            if (pos == 0) { return errno.Z_BADHDR; }
+            break;
+        }
+        let is i64 as nxt = _gzip_member(src, src_len, pos, out);
+        if (nxt < 0) { return nxt; }
+        pos = nxt;
+    }
     return out.len;
 }
 

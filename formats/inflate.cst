@@ -261,7 +261,9 @@ fn _inflate_dynamic(br as *bitreader.BitReader, out as *bytes.Bytes) as i64 {
 }
 
 // --- top-level: decompress a raw DEFLATE stream ------------------------
-fn inflate(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+// Inflate and also report how many input bytes were consumed (byte-aligned to
+// the end of the deflate stream) via consumedOut — used for multi-member gzip.
+fn inflate2(src as *u8, src_len as i64, out as *bytes.Bytes, consumedOut as *i64) as i64 {
     if (_tables_init() < 0) { return errno.Z_OOM; }
     let is bitreader.BitReader as br;
     bitreader.br_init(&br, src, src_len);
@@ -280,5 +282,12 @@ fn inflate(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         else { return errno.Z_BADTYPE; }
         if (r < 0) { return r; }
     }
+    // bytes consumed = ceil(bits_consumed / 8), bits_consumed = pos*8 - nbits
+    consumedOut[0] = (br.pos * 8 - br.nbits + 7) >> 3;
     return out.len;
+}
+
+fn inflate(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    let is i64 as consumed with mut = 0;
+    return inflate2(src, src_len, out, &consumed);
 }
