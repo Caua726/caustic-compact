@@ -4,7 +4,7 @@
 // compressed). A compressed block = a literals section (raw/RLE/Huffman,
 // 1 or 4 reverse bitstreams) + a sequences section (3 interleaved FSE
 // states for literal-length / offset / match-length, with repeat-offset
-// history). Dictionaries and checksum verification are not supported.
+// history). Content checksum is verified; dictionaries are not supported.
 // Faithful port of the zstd educational decoder.
 //   zstd_decompress(src, src_len, out) -> bytes written, or negative error.
 // =======================================================
