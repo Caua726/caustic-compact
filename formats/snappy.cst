@@ -9,6 +9,7 @@
 
 use "../core/errno.cst" as errno;
 use "../core/bytes.cst" as bytes;
+use "../core/checksum.cst" as checksum;
 use "std/mem.cst" only bins, core as mem;
 
 fn _copy_back(out as *bytes.Bytes, offset as i64, length as i64) as i64 {
@@ -194,4 +195,94 @@ fn snappy_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64
     _sn_lit(out, src, lit, src_len - lit);
     mem.core.munmap(cast(*u8, head), 65536 * 8);
     return out.len;
+}
+
+
+// ===================== Snappy framed stream (.sz) =======================
+// Stream identifier + data chunks (compressed 0x00 / uncompressed 0x01) with
+// masked CRC-32C checksums, per the Snappy framing spec. Chunk payload <= 64KB.
+
+fn _sz_put24(out as *bytes.Bytes, v as i64) as void {
+    bytes.bytes_push(out, cast(u8, v & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 16) & 0xFF));
+}
+fn _sz_put32(out as *bytes.Bytes, v as i64) as void {
+    bytes.bytes_push(out, cast(u8, v & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 8) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 16) & 0xFF));
+    bytes.bytes_push(out, cast(u8, (v >> 24) & 0xFF));
+}
+
+fn snappy_frame_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    // stream identifier chunk: 0xff, len=6, "sNaPpY"
+    bytes.bytes_push(out, cast(u8, 0xFF)); _sz_put24(out, 6);
+    bytes.bytes_push(out, cast(u8, 0x73)); bytes.bytes_push(out, cast(u8, 0x4E));
+    bytes.bytes_push(out, cast(u8, 0x61)); bytes.bytes_push(out, cast(u8, 0x50));
+    bytes.bytes_push(out, cast(u8, 0x70)); bytes.bytes_push(out, cast(u8, 0x59));
+
+    let is i64 as pos with mut = 0;
+    let is i64 as first with mut = 1;
+    while (pos < src_len || first == 1) {
+        first = 0;
+        let is i64 as clen with mut = src_len - pos;
+        if (clen > 65536) { clen = 65536; }
+        if (clen == 0) { break; }
+        let is *u8 as chunk = cast(*u8, cast(i64, src) + pos);
+        let is i64 as crc = checksum.crc32c_masked(chunk, clen);
+        let is bytes.Bytes as comp = bytes.bytes_new(256);
+        snappy_compress(chunk, clen, &comp, level);
+        if (comp.len < clen) {
+            bytes.bytes_push(out, cast(u8, 0x00));            // compressed chunk
+            _sz_put24(out, comp.len + 4);
+            _sz_put32(out, crc);
+            bytes.bytes_append(out, comp.ptr, comp.len);
+        } else {
+            bytes.bytes_push(out, cast(u8, 0x01));            // uncompressed chunk
+            _sz_put24(out, clen + 4);
+            _sz_put32(out, crc);
+            bytes.bytes_append(out, chunk, clen);
+        }
+        bytes.bytes_free(&comp);
+        pos = pos + clen;
+    }
+    return out.len;
+}
+
+fn snappy_frame_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    let is i64 as pos with mut = 0;
+    while (pos < src_len) {
+        if (pos + 4 > src_len) { return errno.Z_BADHDR; }
+        let is i64 as ctype = cast(i64, src[pos]);
+        let is i64 as clen = cast(i64, src[pos + 1]) | (cast(i64, src[pos + 2]) << 8) | (cast(i64, src[pos + 3]) << 16);
+        let is i64 as body = pos + 4;
+        if (body + clen > src_len) { return errno.Z_BADHDR; }
+        if (ctype == 0xFF) {
+            // stream identifier: verify "sNaPpY"
+            if (clen != 6) { return errno.Z_BADHDR; }
+            if (cast(i64, src[body]) != 0x73 || cast(i64, src[body + 1]) != 0x4E) { return errno.Z_BADHDR; }
+        } else if (ctype == 0x00 || ctype == 0x01) {
+            if (clen < 4) { return errno.Z_BADHDR; }
+            let is i64 as wantCrc = _read32le_sz(src, body);
+            let is i64 as decStart = out.len;
+            if (ctype == 0x00) {
+                if (snappy_decompress(cast(*u8, cast(i64, src) + body + 4), clen - 4, out) < 0) { return errno.Z_BADHUFF; }
+            } else {
+                if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + body + 4), clen - 4) < 0) { return errno.Z_OOM; }
+            }
+            let is i64 as gotCrc = checksum.crc32c_masked(cast(*u8, cast(i64, out.ptr) + decStart), out.len - decStart);
+            if (gotCrc != wantCrc) { return errno.Z_BADSUM; }
+        } else if (ctype >= 0x80 && ctype <= 0xFE) {
+            // skippable / padding chunk: ignore
+        } else {
+            return errno.Z_BADTYPE;   // reserved unskippable
+        }
+        pos = body + clen;
+    }
+    return out.len;
+}
+
+fn _read32le_sz(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8)
+         | (cast(i64, p[off + 2]) << 16) | (cast(i64, p[off + 3]) << 24);
 }

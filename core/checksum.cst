@@ -56,6 +56,47 @@ fn crc32(buf as *u8, n as i64) as i64 {
     return crc32_update(0, buf, n);
 }
 
+// --- CRC-32C (Castagnoli, reflected poly 0x82F63B78; Snappy framing) ----
+
+let is *i64 as _crcc_table with mut;
+let is i32 as _crcc_ready with mut = 0;
+
+fn _crcc_init() as void {
+    if (_crcc_ready == 1) { return; }
+    _crcc_table = cast(*i64, _c_alloc(256 * 8));
+    let is i64 as n with mut = 0;
+    while (n < 256) {
+        let is i64 as c with mut = n;
+        let is i64 as k with mut = 0;
+        while (k < 8) {
+            if ((c & 1) == 1) { c = 0x82F63B78 ^ (c >> 1); }
+            else { c = c >> 1; }
+            k = k + 1;
+        }
+        _crcc_table[n] = c;
+        n = n + 1;
+    }
+    _crcc_ready = 1;
+}
+
+fn crc32c(buf as *u8, n as i64) as i64 {
+    _crcc_init();
+    let is i64 as c with mut = 0xFFFFFFFF;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as idx = (c ^ cast(i64, buf[i])) & 0xFF;
+        c = _crcc_table[idx] ^ (c >> 8);
+        i = i + 1;
+    }
+    return c ^ 0xFFFFFFFF;
+}
+
+// Snappy's masked CRC-32C: rotate right 15 then add a constant (mod 2^32).
+fn crc32c_masked(buf as *u8, n as i64) as i64 {
+    let is i64 as c = crc32c(buf, n) & 0xFFFFFFFF;
+    return (((c >> 15) | (c << 17)) + 0xA282EAD8) & 0xFFFFFFFF;
+}
+
 // --- Adler-32 -----------------------------------------------------------
 
 let is i64 as _ADLER_MOD with imut = 65521;
