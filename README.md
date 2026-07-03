@@ -34,7 +34,7 @@ This is an honest list of where it stops short of the reference implementations.
 - **brotli encode** does real LZ77 + Huffman (insert-and-copy commands with explicit distances) and is competitive with `brotli -q11` on the corpus — it beats it on `window` and `hello`, ties on `big`, and trails on pathological pure-repetition (`abc`) where the reference's distance-ring rep-codes win. No context modeling or static-dictionary references yet.
 - **zstd encode uses raw literals** — the LZ77 sequences are FSE-coded with cross-block matching, which is competitive with `zstd -19` on the test corpus (often within a few percent, sometimes smaller). Literals are not yet Huffman-coded, so inputs whose post-match literals are *both* large and low-entropy would lag; high-entropy literals (the common case) cost the same either way.
 - **bzip2 encode uses one Huffman table per block** instead of the reference's up-to-six with per-group selectors (multi-block over 900 KB is supported). Skipping the selector/extra-table overhead actually makes it *beat* `bzip2 -9` on this corpus; the multi-table refinement would only pay off on large, non-uniform inputs.
-- One-shot and in-memory — no streaming API. No large-window Brotli, no xz delta/BCJ filters, no dictionaries.
+- The codecs are one-shot in memory (mmap-backed output). `stream.cst` wraps them with fd I/O + magic autodetection and `examples/cctool` is a full CLI, but the backward-reading decoders still buffer the whole compressed input rather than running in constant memory.
 
 ## Build and test
 
@@ -52,7 +52,8 @@ caustic -c caustic_compact.cst            # compile-check the whole library (no 
 core/      errno · bytes (mmap-backed) · bitreader / bitwriter · huffman · checksum (CRC-32 / Adler-32 / xxHash32)
 formats/   inflate · zlib · gzip · deflate · lz4 · snappy · lzma · lzma2 · xz · bzip2 · zstd · brotli
            brotli_dict (122 KB dictionary) · brotli_transforms
-examples/  zcat (gunzip-to-stdout) · gzc (gzip a file)
+examples/  cctool (compress/decompress any format) · zcat · gzc
+stream.cst (fd-oriented streaming layer with format autodetection)
 tests/     run.cst (the runner) · fixtures/ (committed vectors)
 ```
 

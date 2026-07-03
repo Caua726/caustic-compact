@@ -1,0 +1,108 @@
+// =======================================================
+// caustic-compact/examples/cctool.cst
+// Command-line front end over stream.cst.
+//
+//   cctool c FORMAT [INFILE] [OUTFILE]   compress   (FORMAT required)
+//   cctool d [INFILE] [OUTFILE]          decompress (format autodetected)
+//   cctool d FORMAT INFILE [OUTFILE]     decompress with an explicit format
+//
+// FORMAT: gzip zlib deflate xz lzma bzip2 zstd brotli lz4 snappy snappy-frame
+// INFILE/OUTFILE default to stdin/stdout; "-" also means the standard stream.
+// =======================================================
+
+use "std/io.cst"  as io;
+use "std/env.cst" as env;
+use "../stream.cst" as stream;
+
+fn _streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is i64 as ca = cast(i64, a[i]);
+        let is i64 as cb = cast(i64, b[i]);
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _fmt_from_name(name as *u8) as i64 {
+    if (_streq(name, "gzip") == 1)         { return stream.FMT_GZIP; }
+    if (_streq(name, "zlib") == 1)         { return stream.FMT_ZLIB; }
+    if (_streq(name, "deflate") == 1)      { return stream.FMT_DEFLATE; }
+    if (_streq(name, "xz") == 1)           { return stream.FMT_XZ; }
+    if (_streq(name, "lzma") == 1)         { return stream.FMT_LZMA; }
+    if (_streq(name, "bzip2") == 1)        { return stream.FMT_BZIP2; }
+    if (_streq(name, "zstd") == 1)         { return stream.FMT_ZSTD; }
+    if (_streq(name, "brotli") == 1)       { return stream.FMT_BROTLI; }
+    if (_streq(name, "lz4") == 1)          { return stream.FMT_LZ4; }
+    if (_streq(name, "snappy") == 1)       { return stream.FMT_SNAPPY; }
+    if (_streq(name, "snappy-frame") == 1) { return stream.FMT_SNAPPY_FRAME; }
+    return stream.FMT_UNKNOWN;
+}
+
+fn _open_in(path as *u8) as i64 {
+    if (cast(i64, path) == 0) { return io.STDIN; }
+    if (cast(i64, path[0]) == 0x2D && cast(i64, path[1]) == 0) { return io.STDIN; }   // "-"
+    return io._open_read(path);
+}
+fn _open_out(path as *u8) as i64 {
+    if (cast(i64, path) == 0) { return io.STDOUT; }
+    if (cast(i64, path[0]) == 0x2D && cast(i64, path[1]) == 0) { return io.STDOUT; }
+    return io._open_write(path);
+}
+
+fn _usage() as i32 {
+    io.write_str(io.STDERR, "usage: cctool c FORMAT [in] [out] | cctool d [FORMAT] [in] [out]\n");
+    io.write_str(io.STDERR, "formats: gzip zlib deflate xz lzma bzip2 zstd brotli lz4 snappy snappy-frame\n");
+    return 2;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() < 2) { return _usage(); }
+    let is *u8 as mode = env.argv(1);
+    let is i64 as isC = cast(i64, mode[0]);
+
+    if (isC == 0x63) {                                  // "c" compress
+        if (env.argc() < 3) { return _usage(); }
+        let is i64 as fmt = _fmt_from_name(env.argv(2));
+        if (fmt == stream.FMT_UNKNOWN) { io.write_str(io.STDERR, "unknown format\n"); return _usage(); }
+        let is *u8 as inp with mut = cast(*u8, 0);
+        let is *u8 as outp with mut = cast(*u8, 0);
+        if (env.argc() >= 4) { inp = env.argv(3); }
+        if (env.argc() >= 5) { outp = env.argv(4); }
+        let is i64 as ifd = _open_in(inp);
+        let is i64 as ofd = _open_out(outp);
+        if (ifd < 0 || ofd < 0) { io.write_str(io.STDERR, "cannot open file\n"); return 1; }
+        let is i64 as r = stream.stream_compress_fd(fmt, ifd, ofd, 2);
+        if (ifd != io.STDIN) { io._close_fd(ifd); }
+        if (ofd != io.STDOUT) { io._close_fd(ofd); }
+        if (r < 0) { io.write_str(io.STDERR, "compress failed\n"); return 1; }
+        return 0;
+    }
+
+    if (isC == 0x64) {                                  // "d" decompress
+        // optional explicit format as argv[2] if it names a format
+        let is i64 as fmt with mut = stream.FMT_UNKNOWN;
+        let is i64 as ai with mut = 2;
+        if (env.argc() >= 3) {
+            let is i64 as maybe = _fmt_from_name(env.argv(2));
+            if (maybe != stream.FMT_UNKNOWN) { fmt = maybe; ai = 3; }
+        }
+        let is *u8 as inp with mut = cast(*u8, 0);
+        let is *u8 as outp with mut = cast(*u8, 0);
+        if (env.argc() > ai) { inp = env.argv(ai); }
+        if (env.argc() > ai + 1) { outp = env.argv(ai + 1); }
+        let is i64 as ifd = _open_in(inp);
+        let is i64 as ofd = _open_out(outp);
+        if (ifd < 0 || ofd < 0) { io.write_str(io.STDERR, "cannot open file\n"); return 1; }
+        let is i64 as r = stream.stream_decompress_fd(fmt, ifd, ofd);
+        if (ifd != io.STDIN) { io._close_fd(ifd); }
+        if (ofd != io.STDOUT) { io._close_fd(ofd); }
+        if (r < 0) { io.write_str(io.STDERR, "decompress failed (bad data or unknown format)\n"); return 1; }
+        return 0;
+    }
+
+    return _usage();
+}

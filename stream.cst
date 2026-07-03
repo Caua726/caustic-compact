@@ -1,0 +1,130 @@
+// =======================================================
+// caustic-compact/stream.cst
+// A convenience streaming layer over the one-shot codecs: read a whole
+// stream from a file descriptor, dispatch by format (with magic-byte
+// autodetection on decode), and write the result to a descriptor.
+//
+// Note: the backward-reading decoders (zstd, brotli) need the full
+// compressed input available, so this reads the input fully before
+// decoding rather than running in constant memory. The output is an
+// mmap-backed buffer (paged by the OS) written out in one pass.
+// =======================================================
+
+use "core/errno.cst"   as errno;
+use "core/bytes.cst"   as bytes;
+use "std/io.cst"       as io;
+use "std/mem.cst" only bins, core as mem;
+
+use "formats/inflate.cst" as inflate;
+use "formats/deflate.cst" as deflate;
+use "formats/gzip.cst"    as gzip;
+use "formats/zlib.cst"    as zlib;
+use "formats/xz.cst"      as xz;
+use "formats/lzma.cst"    as lzma;
+use "formats/bzip2.cst"   as bzip2;
+use "formats/zstd.cst"    as zstd;
+use "formats/brotli.cst"  as brotli;
+use "formats/lz4.cst"     as lz4;
+use "formats/snappy.cst"  as snappy;
+
+let is i64 as FMT_UNKNOWN      with imut = 0;
+let is i64 as FMT_GZIP         with imut = 1;
+let is i64 as FMT_ZLIB         with imut = 2;
+let is i64 as FMT_DEFLATE      with imut = 3;
+let is i64 as FMT_XZ           with imut = 4;
+let is i64 as FMT_LZMA         with imut = 5;
+let is i64 as FMT_BZIP2        with imut = 6;
+let is i64 as FMT_ZSTD         with imut = 7;
+let is i64 as FMT_BROTLI       with imut = 8;
+let is i64 as FMT_LZ4          with imut = 9;
+let is i64 as FMT_SNAPPY       with imut = 10;
+let is i64 as FMT_SNAPPY_FRAME with imut = 11;
+
+// Read a whole fd into `out` in 64 KB chunks (works for pipes/stdin too).
+fn stream_read_fd(fd as i64, out as *bytes.Bytes) as i64 {
+    let is *u8 as buf = mem.core.mmap_anon(65536);
+    while (1 == 1) {
+        let is i64 as n = io._read_fd(fd, buf, 65536);
+        if (n <= 0) { break; }
+        if (bytes.bytes_append(out, buf, n) < 0) { return errno.Z_OOM; }
+    }
+    mem.core.munmap(buf, 65536);
+    return out.len;
+}
+
+// Detect the compressed format from the leading magic bytes (FMT_UNKNOWN if
+// there is none — brotli, raw LZMA and raw Snappy carry no signature).
+fn stream_detect(src as *u8, len as i64) as i64 {
+    if (len >= 6 && cast(i64, src[0]) == 0xFD && cast(i64, src[1]) == 0x37
+        && cast(i64, src[2]) == 0x7A && cast(i64, src[3]) == 0x58
+        && cast(i64, src[4]) == 0x5A && cast(i64, src[5]) == 0x00) { return FMT_XZ; }
+    if (len >= 2 && cast(i64, src[0]) == 0x1F && cast(i64, src[1]) == 0x8B) { return FMT_GZIP; }
+    if (len >= 3 && cast(i64, src[0]) == 0x42 && cast(i64, src[1]) == 0x5A
+        && cast(i64, src[2]) == 0x68) { return FMT_BZIP2; }
+    if (len >= 4 && cast(i64, src[0]) == 0x28 && cast(i64, src[1]) == 0xB5
+        && cast(i64, src[2]) == 0x2F && cast(i64, src[3]) == 0xFD) { return FMT_ZSTD; }
+    if (len >= 4 && cast(i64, src[0]) == 0x04 && cast(i64, src[1]) == 0x22
+        && cast(i64, src[2]) == 0x4D && cast(i64, src[3]) == 0x18) { return FMT_LZ4; }
+    if (len >= 10 && cast(i64, src[0]) == 0xFF && cast(i64, src[1]) == 0x06
+        && cast(i64, src[4]) == 0x73 && cast(i64, src[5]) == 0x4E) { return FMT_SNAPPY_FRAME; }
+    // zlib: CM=8 in low nibble of byte0 and (byte0*256+byte1) % 31 == 0
+    if (len >= 2 && (cast(i64, src[0]) & 0x0F) == 8
+        && (((cast(i64, src[0]) << 8) | cast(i64, src[1])) % 31) == 0) { return FMT_ZLIB; }
+    return FMT_UNKNOWN;
+}
+
+fn stream_compress(fmt as i64, src as *u8, len as i64, out as *bytes.Bytes, level as i64) as i64 {
+    if (fmt == FMT_GZIP)         { return gzip.gzip_compress(src, len, out, level); }
+    if (fmt == FMT_ZLIB)         { return zlib.zlib_compress(src, len, out, level); }
+    if (fmt == FMT_DEFLATE)      { return deflate.deflate_compress(src, len, out, level); }
+    if (fmt == FMT_XZ)           { return xz.xz_compress(src, len, out, level); }
+    if (fmt == FMT_LZMA)         { return lzma.lzma_alone_compress(src, len, out, level); }
+    if (fmt == FMT_BZIP2)        { return bzip2.bzip2_compress(src, len, out, level); }
+    if (fmt == FMT_ZSTD)         { return zstd.zstd_compress(src, len, out, level); }
+    if (fmt == FMT_BROTLI)       { return brotli.brotli_compress(src, len, out, level); }
+    if (fmt == FMT_LZ4)          { return lz4.lz4_compress(src, len, out, level); }
+    if (fmt == FMT_SNAPPY)       { return snappy.snappy_compress(src, len, out, level); }
+    if (fmt == FMT_SNAPPY_FRAME) { return snappy.snappy_frame_compress(src, len, out, level); }
+    return errno.Z_BADTYPE;
+}
+
+fn stream_decompress(fmt as i64, src as *u8, len as i64, out as *bytes.Bytes) as i64 {
+    if (fmt == FMT_GZIP)         { return gzip.gzip_decompress(src, len, out); }
+    if (fmt == FMT_ZLIB)         { return zlib.zlib_decompress(src, len, out); }
+    if (fmt == FMT_DEFLATE)      { return inflate.inflate(src, len, out); }
+    if (fmt == FMT_XZ)           { return xz.xz_decompress(src, len, out); }
+    if (fmt == FMT_LZMA)         { return lzma.lzma_alone_decompress(src, len, out); }
+    if (fmt == FMT_BZIP2)        { return bzip2.bzip2_decompress(src, len, out); }
+    if (fmt == FMT_ZSTD)         { return zstd.zstd_decompress(src, len, out); }
+    if (fmt == FMT_BROTLI)       { return brotli.brotli_decompress(src, len, out); }
+    if (fmt == FMT_LZ4)          { return lz4.lz4_decompress(src, len, out); }
+    if (fmt == FMT_SNAPPY)       { return snappy.snappy_decompress(src, len, out); }
+    if (fmt == FMT_SNAPPY_FRAME) { return snappy.snappy_frame_decompress(src, len, out); }
+    return errno.Z_BADTYPE;
+}
+
+// Read all of in_fd, compress with `fmt`, write the result to out_fd.
+fn stream_compress_fd(fmt as i64, in_fd as i64, out_fd as i64, level as i64) as i64 {
+    let is bytes.Bytes as src = bytes.bytes_new(65536);
+    if (stream_read_fd(in_fd, &src) < 0) { bytes.bytes_free(&src); return errno.Z_OOM; }
+    let is bytes.Bytes as out = bytes.bytes_new(65536);
+    let is i64 as r = stream_compress(fmt, src.ptr, src.len, &out, level);
+    if (r >= 0) { io.write_bytes(out_fd, out.ptr, out.len); }
+    bytes.bytes_free(&src); bytes.bytes_free(&out);
+    return r;
+}
+
+// Read all of in_fd, decompress (autodetecting when fmt is FMT_UNKNOWN),
+// write to out_fd.
+fn stream_decompress_fd(fmt as i64, in_fd as i64, out_fd as i64) as i64 {
+    let is bytes.Bytes as src = bytes.bytes_new(65536);
+    if (stream_read_fd(in_fd, &src) < 0) { bytes.bytes_free(&src); return errno.Z_OOM; }
+    let is i64 as f with mut = fmt;
+    if (f == FMT_UNKNOWN) { f = stream_detect(src.ptr, src.len); }
+    if (f == FMT_UNKNOWN) { bytes.bytes_free(&src); return errno.Z_BADHDR; }
+    let is bytes.Bytes as out = bytes.bytes_new(65536);
+    let is i64 as r = stream_decompress(f, src.ptr, src.len, &out);
+    if (r >= 0) { io.write_bytes(out_fd, out.ptr, out.len); }
+    bytes.bytes_free(&src); bytes.bytes_free(&out);
+    return r;
+}
