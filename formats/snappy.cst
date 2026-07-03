@@ -264,14 +264,21 @@ fn snappy_frame_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i
         } else if (ctype == 0x00 || ctype == 0x01) {
             if (clen < 4) { return errno.Z_BADHDR; }
             let is i64 as wantCrc = _read32le_sz(src, body);
-            let is i64 as decStart = out.len;
+            // each framed chunk is self-contained: decode it into a fresh
+            // buffer (so back-references are chunk-relative) then append.
+            let is bytes.Bytes as chunk = bytes.bytes_new(256);
             if (ctype == 0x00) {
-                if (snappy_decompress(cast(*u8, cast(i64, src) + body + 4), clen - 4, out) < 0) { return errno.Z_BADHUFF; }
+                if (snappy_decompress(cast(*u8, cast(i64, src) + body + 4), clen - 4, &chunk) < 0) {
+                    bytes.bytes_free(&chunk); return errno.Z_BADHUFF;
+                }
             } else {
-                if (bytes.bytes_append(out, cast(*u8, cast(i64, src) + body + 4), clen - 4) < 0) { return errno.Z_OOM; }
+                if (bytes.bytes_append(&chunk, cast(*u8, cast(i64, src) + body + 4), clen - 4) < 0) {
+                    bytes.bytes_free(&chunk); return errno.Z_OOM;
+                }
             }
-            let is i64 as gotCrc = checksum.crc32c_masked(cast(*u8, cast(i64, out.ptr) + decStart), out.len - decStart);
-            if (gotCrc != wantCrc) { return errno.Z_BADSUM; }
+            if (checksum.crc32c_masked(chunk.ptr, chunk.len) != wantCrc) { bytes.bytes_free(&chunk); return errno.Z_BADSUM; }
+            if (bytes.bytes_append(out, chunk.ptr, chunk.len) < 0) { bytes.bytes_free(&chunk); return errno.Z_OOM; }
+            bytes.bytes_free(&chunk);
         } else if (ctype >= 0x80 && ctype <= 0xFE) {
             // skippable / padding chunk: ignore
         } else {
