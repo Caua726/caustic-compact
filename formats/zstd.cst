@@ -555,7 +555,44 @@ fn _decompress_block(s as *IStr, blockLen as i64, out as *bytes.Bytes) as i64 {
     return 0;
 }
 
+fn _read4le(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8)
+         | (cast(i64, p[off + 2]) << 16) | (cast(i64, p[off + 3]) << 24);
+}
+
+// Load a zstd dictionary: a raw prefix, or a trained dict (magic 0xEC30A437)
+// carrying entropy tables + 3 repeat offsets + content. Prepends the content
+// to `out` (so back-references can reach it) and returns the content length,
+// or a negative error. Leaves _litT/_llT/_ofT/_mlT + _o0/_o1/_o2 ready.
+fn _zstd_load_dict(dict as *u8, dict_len as i64, out as *bytes.Bytes) as i64 {
+    if (dict_len >= 8 && cast(i64, dict[0]) == 0x37 && cast(i64, dict[1]) == 0xA4
+        && cast(i64, dict[2]) == 0x30 && cast(i64, dict[3]) == 0xEC) {
+        // trained dictionary: magic(4) + dictID(4) + entropy tables + reps + content
+        let is IStr as ds;
+        ds.base = dict; ds.off = 8; ds.len = dict_len - 8; ds.bit = 0;
+        _huf_table(&_litT, &ds); _ialign(&ds);
+        _fse_header(&_ofT, &ds); _ialign(&ds);
+        _fse_header(&_mlT, &ds); _ialign(&ds);
+        _fse_header(&_llT, &ds); _ialign(&ds);
+        if (ds.off + 12 > dict_len) { return errno.Z_BADHDR; }
+        _o0 = _read4le(dict, ds.off); _o1 = _read4le(dict, ds.off + 4); _o2 = _read4le(dict, ds.off + 8);
+        ds.off = ds.off + 12;
+        let is i64 as clen = dict_len - ds.off;
+        if (clen > 0) { if (bytes.bytes_append(out, cast(*u8, cast(i64, dict) + ds.off), clen) < 0) { return errno.Z_OOM; } }
+        return clen;
+    }
+    // raw dictionary: the whole buffer is content, default reps/tables
+    _o0 = 1; _o1 = 4; _o2 = 8;
+    _llT.ok = 0; _ofT.ok = 0; _mlT.ok = 0; _litT.ok = 0;
+    if (dict_len > 0) { if (bytes.bytes_append(out, dict, dict_len) < 0) { return errno.Z_OOM; } }
+    return dict_len;
+}
+
 fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    return zstd_decompress_dict(src, src_len, out, cast(*u8, 0), 0);
+}
+
+fn zstd_decompress_dict(src as *u8, src_len as i64, out as *bytes.Bytes, dict as *u8, dict_len as i64) as i64 {
     _zalloc();
     _tabs();
     if (src_len < 5) { return errno.Z_BADHDR; }
@@ -583,9 +620,15 @@ fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         _iread(&s, fb * 8);                                    // frame content size (ignored)
     }
 
-    // reset repeat-offset history and entropy-table validity
-    _o0 = 1; _o1 = 4; _o2 = 8;
-    _llT.ok = 0; _ofT.ok = 0; _mlT.ok = 0; _litT.ok = 0;
+    // dictionary prefix (or a reset when none) — content prepended to `out`
+    let is i64 as dictStart with mut = 0;
+    if (dict_len > 0) {
+        dictStart = _zstd_load_dict(dict, dict_len, out);
+        if (dictStart < 0) { return dictStart; }
+    } else {
+        _o0 = 1; _o1 = 4; _o2 = 8;
+        _llT.ok = 0; _ofT.ok = 0; _mlT.ok = 0; _litT.ok = 0;
+    }
 
     let is i64 as last with mut = 0;
     while (last == 0) {
@@ -611,8 +654,15 @@ fn zstd_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
     if (checksumFlag == 1) {
         if ((s.bit & 7) != 0) { s.off = s.off + 1; s.bit = 0; }
         let is i64 as want = _iread(&s, 32) & 0xFFFFFFFF;
-        let is i64 as got = checksum.xxhash64(out.ptr, out.len) & 0xFFFFFFFF;
+        let is i64 as got = checksum.xxhash64(cast(*u8, cast(i64, out.ptr) + dictStart), out.len - dictStart) & 0xFFFFFFFF;
         if (got != want) { return errno.Z_BADSUM; }
+    }
+    // remove the prepended dictionary content, leaving only the frame output
+    if (dictStart > 0) {
+        let is i64 as n = out.len - dictStart;
+        let is i64 as i with mut = 0;
+        while (i < n) { out.ptr[i] = out.ptr[dictStart + i]; i = i + 1; }
+        out.len = n;
     }
     return out.len;
 }
