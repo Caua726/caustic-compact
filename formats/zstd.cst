@@ -21,6 +21,11 @@ struct IStr { base as *u8; off as i64; len as i64; bit as i64; }
 fn _rdLE(p as *u8, startBit as i64, n as i64) as i64 {
     let is i64 as bytepos with mut = startBit >> 3;
     let is i64 as bitoff with mut = startBit & 7;
+    if (bytepos + 8 <= _inLen && n <= 56) {          // fast path: one 64-bit LE load
+        let is i64 as x = cast(*i64, cast(i64, p) + bytepos)[0];
+        let is i64 as r = cast(i64, cast(u64, x) >> cast(u64, bitoff));
+        return r & ((1 << n) - 1);
+    }
     let is i64 as res with mut = 0;
     let is i64 as shift with mut = 0;
     let is i64 as left with mut = n;
@@ -90,6 +95,7 @@ let is Fse as _llT with mut;
 let is Fse as _ofT with mut;
 let is Fse as _mlT with mut;
 let is Huf as _litT with mut;
+let is i64 as _inLen with mut;
 let is i64 as _o0 with mut;
 let is i64 as _o1 with mut;
 let is i64 as _o2 with mut;
@@ -609,6 +615,7 @@ fn zstd_decompress_dict(src as *u8, src_len as i64, out as *bytes.Bytes, dict as
     if (cast(i64, src[3]) != 0xFD) { return errno.Z_BADHDR; }
 
     let is IStr as s;
+    _inLen = src_len;
     s.base = src; s.off = 4; s.len = src_len - 4; s.bit = 0;
 
     let is i64 as desc = _iread(&s, 8);

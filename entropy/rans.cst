@@ -1,0 +1,205 @@
+// =======================================================
+// caustic-compact/entropy/rans.cst
+// Static rANS entropy coder — the CSIF entropy substrate (spec §3), byte
+// alphabet, single lane, M=12 (TOTAL=4096), 8-bit renorm, RANS_L=1<<23.
+// Encode writes bytes backward; decode reads forward (the pinned invariant).
+// The normalized frequency table is built by the largest-remainder method with
+// a guaranteed floor of 1 (§3.6). Slot->symbol lookup uses a direct TOTAL-sized
+// table (byte-identical to the alias method for state advance, §3.6.2).
+//
+// Stream = [table block §3.3.1][state 4B LE][rANS bytes]. The caller passes the
+// symbol count to decode (the codec knows it from geometry).
+//
+//   rans_encode(syms, n, out) -> 0, or negative errno; appends the stream.
+//   rans_decode(src, src_len, n, out) -> 0, or negative; fills n symbols.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+use "std/mem.cst" only bins, core as mem;
+
+let is i64 as RANS_L with imut = 8388608;   // 1<<23
+let is i64 as RANS_M with imut = 12;
+let is i64 as RANS_TOTAL with imut = 4096;
+let is i64 as RANS_N with imut = 256;
+
+fn _w16(o as *bytes.Bytes, v as i64) as void {
+    bytes.bytes_push(o, cast(u8, v & 255));
+    bytes.bytes_push(o, cast(u8, (v >> 8) & 255));
+}
+
+// Build normalized freq[] (Σ = TOTAL, used symbols >= 1) and cum[] from counts.
+fn _build_freq(cnt as *i64, freq as *i64, cum as *i64) as void {
+    let is i64 as total with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < RANS_N) { total = total + cnt[s]; s = s + 1; }
+    if (total == 0) {
+        // Degenerate (no symbols): put all mass on symbol 0.
+        s = 0; while (s < RANS_N) { freq[s] = 0; s = s + 1; }
+        freq[0] = RANS_TOTAL;
+    } else {
+        let is [256]i64 as rem;
+        let is i64 as sum with mut = 0;
+        s = 0;
+        while (s < RANS_N) {
+            if (cnt[s] == 0) { freq[s] = 0; rem[s] = 0 - 1000000000; }
+            else {
+                let is i64 as prod = cnt[s] * RANS_TOTAL;
+                let is i64 as f with mut = prod / total;
+                if (f < 1) { f = 1; }
+                freq[s] = f;
+                rem[s] = prod - f * total;
+                sum = sum + f;
+            }
+            s = s + 1;
+        }
+        // Largest-remainder fix to exactly TOTAL.
+        while (sum < RANS_TOTAL) {
+            // add 1 to the symbol with the largest remainder (tie: smaller index)
+            let is i64 as best with mut = 0 - 1;
+            let is i64 as bestrem with mut = 0;
+            let is i64 as k with mut = 0;
+            while (k < RANS_N) {
+                if (freq[k] > 0) {
+                    if (best < 0) { best = k; bestrem = rem[k]; }
+                    else { if (rem[k] > bestrem) { best = k; bestrem = rem[k]; } }
+                }
+                k = k + 1;
+            }
+            freq[best] = freq[best] + 1;
+            rem[best] = 0 - 1000000000;
+            sum = sum + 1;
+        }
+        while (sum > RANS_TOTAL) {
+            // subtract 1 from the smallest remainder among freq>1 (tie: larger index)
+            let is i64 as best with mut = 0 - 1;
+            let is i64 as bestrem with mut = 0;
+            let is i64 as k with mut = 0;
+            while (k < RANS_N) {
+                if (freq[k] > 1) {
+                    if (best < 0) { best = k; bestrem = rem[k]; }
+                    else { if (rem[k] <= bestrem) { best = k; bestrem = rem[k]; } }
+                }
+                k = k + 1;
+            }
+            freq[best] = freq[best] - 1;
+            rem[best] = 1000000000;
+            sum = sum - 1;
+        }
+    }
+    // cumulative starts
+    cum[0] = 0;
+    let is i64 as i with mut = 1;
+    while (i < RANS_N) { cum[i] = cum[i - 1] + freq[i - 1]; i = i + 1; }
+}
+
+fn rans_encode(syms as *u8, n as i64, out as *bytes.Bytes) as i64 {
+    let is [256]i64 as cnt;
+    let is [256]i64 as freq;
+    let is [256]i64 as cum;
+    let is i64 as s with mut = 0;
+    while (s < RANS_N) { cnt[s] = 0; s = s + 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { let is i64 as v = cast(i64, syms[i]); cnt[v] = cnt[v] + 1; i = i + 1; }
+    _build_freq(cast(*i64, &cnt), cast(*i64, &freq), cast(*i64, &cum));
+
+    // Table block (§3.3.1): M, table_src=0, n, table_ref=0, reserved=0, freq[].
+    bytes.bytes_push(out, cast(u8, RANS_M));
+    bytes.bytes_push(out, cast(u8, 0));
+    _w16(out, RANS_N);
+    _w16(out, 0);
+    _w16(out, 0);
+    s = 0; while (s < RANS_N) { _w16(out, freq[s]); s = s + 1; }
+
+    // rANS encode backward into a scratch buffer.
+    let is i64 as cap = n * 2 + 64;
+    let is *u8 as bk = mem.core.mmap_anon(cap);
+    if (cast(i64, bk) <= 0) { return errno.Z_OOM; }
+    let is i64 as pos with mut = cap;
+    let is i64 as x with mut = RANS_L;
+    i = n - 1;
+    while (i >= 0) {
+        let is i64 as sym = cast(i64, syms[i]);
+        let is i64 as f = freq[sym];
+        let is i64 as c = cum[sym];
+        let is i64 as x_max = ((RANS_L >> RANS_M) << 8) * f;
+        while (x >= x_max) {
+            pos = pos - 1;
+            bk[pos] = cast(u8, x & 255);
+            x = x >> 8;
+        }
+        let is i64 as q = x / f;
+        x = (q << RANS_M) + (x - q * f) + c;
+        i = i - 1;
+    }
+    // Flush the 4-byte state at the front (little-endian).
+    pos = pos - 4;
+    bk[pos]     = cast(u8, x & 255);
+    bk[pos + 1] = cast(u8, (x >> 8) & 255);
+    bk[pos + 2] = cast(u8, (x >> 16) & 255);
+    bk[pos + 3] = cast(u8, (x >> 24) & 255);
+
+    bytes.bytes_append(out, cast(*u8, cast(i64, bk) + pos), cap - pos);
+    mem.core.munmap(bk, cap);
+    return 0;
+}
+
+fn rans_decode(src as *u8, src_len as i64, n as i64, out as *u8) as i64 {
+    if (src_len < 8) { return errno.Z_EOF; }
+    let is i64 as M = cast(i64, src[0]);
+    let is i64 as n_alpha = cast(i64, src[2]) | (cast(i64, src[3]) << 8);
+    if (M != RANS_M) { return errno.Z_BADHDR; }
+    if (n_alpha != RANS_N) { return errno.Z_BADHDR; }
+
+    let is [256]i64 as freq;
+    let is [256]i64 as cum;
+    let is i64 as tsum with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < RANS_N) {
+        let is i64 as off = 8 + s * 2;
+        let is i64 as f = cast(i64, src[off]) | (cast(i64, src[off + 1]) << 8);
+        freq[s] = f;
+        tsum = tsum + f;
+        s = s + 1;
+    }
+    if (tsum != RANS_TOTAL) { return errno.Z_BADSUM; }
+    cum[0] = 0;
+    let is i64 as ci with mut = 1;
+    while (ci < RANS_N) { cum[ci] = cum[ci - 1] + freq[ci - 1]; ci = ci + 1; }
+
+    // slot -> symbol table.
+    let is *u8 as slot2 = mem.core.mmap_anon(RANS_TOTAL);
+    if (cast(i64, slot2) <= 0) { return errno.Z_OOM; }
+    s = 0;
+    while (s < RANS_N) {
+        let is i64 as a with mut = cum[s];
+        let is i64 as e = cum[s] + freq[s];
+        while (a < e) { slot2[a] = cast(u8, s); a = a + 1; }
+        s = s + 1;
+    }
+
+    let is i64 as tbl = 8 + RANS_N * 2;
+    if (tbl + 4 > src_len) { mem.core.munmap(slot2, RANS_TOTAL); return errno.Z_EOF; }
+    let is i64 as x with mut = cast(i64, src[tbl]) | (cast(i64, src[tbl + 1]) << 8)
+        | (cast(i64, src[tbl + 2]) << 16) | (cast(i64, src[tbl + 3]) << 24);
+    let is i64 as in_pos with mut = tbl + 4;
+    let is i64 as mask = RANS_TOTAL - 1;
+
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as slot = x & mask;
+        let is i64 as sym = cast(i64, slot2[slot]);
+        let is i64 as f = freq[sym];
+        let is i64 as c = cum[sym];
+        x = f * (x >> M) + slot - c;
+        while (x < RANS_L) {
+            if (in_pos >= src_len) { mem.core.munmap(slot2, RANS_TOTAL); return errno.Z_EOF; }
+            x = (x << 8) | cast(i64, src[in_pos]);
+            in_pos = in_pos + 1;
+        }
+        out[i] = cast(u8, sym);
+        i = i + 1;
+    }
+    mem.core.munmap(slot2, RANS_TOTAL);
+    return 0;
+}
