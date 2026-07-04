@@ -85,11 +85,15 @@ fn _lz_copy(out as *bytes.Bytes, dist as i64, length as i64) as i64 {
     let is i64 as src with mut = out.len - dist;
     let is i64 as dst with mut = out.len;
     let is i64 as end = out.len + length;
-    while (dst < end) {
-        out.ptr[dst] = out.ptr[src];
-        src = src + 1;
-        dst = dst + 1;
+    let is i64 as p = cast(i64, out.ptr);
+    if (dist >= 8) {
+        // non-overlapping within an 8-byte step (dst >= src + 8): copy 8 at a time
+        while (dst + 8 <= end) {
+            cast(*i64, p + dst)[0] = cast(*i64, p + src)[0];
+            src = src + 8; dst = dst + 8;
+        }
     }
+    while (dst < end) { out.ptr[dst] = out.ptr[src]; src = src + 1; dst = dst + 1; }
     out.len = end;
     return length;
 }
