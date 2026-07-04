@@ -1305,6 +1305,24 @@ fn _nz_one(arr as *i64, n as i64) as i64 {
     return 0;
 }
 
+// Longest match at pos (already inserted); explicit hash chain via prev.
+fn _bmatch(src as *u8, pos as i64, src_len as i64, prev as *i64, distOut as *i64) as i64 {
+    let is i64 as cand with mut = prev[pos];
+    let is i64 as bestLen with mut = 0;
+    let is i64 as bestDist with mut = 0;
+    let is i64 as chain with mut = 0;
+    while (cand >= 0) {
+        if (chain >= 128) { break; }
+        let is i64 as l with mut = 0;
+        while (pos + l < src_len) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
+        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        cand = prev[cand];
+        chain = chain + 1;
+    }
+    distOut[0] = bestDist;
+    return bestLen;
+}
+
 fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) as i64 {
     _tabs();
     _build_dist_lut();
@@ -1336,30 +1354,30 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
 
     let is i64 as pos with mut = 0;
     let is i64 as anchor with mut = 0;
+    let is i64 as hins with mut = 0 - 1;
     while (pos + 4 <= src_len) {
         let is i64 as h = ((cast(i64, src[pos]) << 11) ^ (cast(i64, src[pos + 1]) << 7)
                           ^ (cast(i64, src[pos + 2]) << 3) ^ cast(i64, src[pos + 3])) & (HSIZE - 1);
-        let is i64 as cand with mut = head[h];
-        prev[pos] = cand; head[h] = pos;
-        let is i64 as bestLen with mut = 0;
+        prev[pos] = head[h]; head[h] = pos; if (pos > hins) { hins = pos; }
         let is i64 as bestDist with mut = 0;
-        let is i64 as chain with mut = 0;
-        while (cand >= 0) {
-            if (chain >= 128) { break; }
-            let is i64 as l with mut = 0;
-            while (pos + l < src_len) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
-            if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
-            cand = prev[cand];
-            chain = chain + 1;
-        }
-        if (bestLen >= 4) {
+        let is i64 as bestLen with mut = _bmatch(src, pos, src_len, prev, &bestDist);
+        if (bestLen < 4) { pos = pos + 1; }
+        else {
+            // 1-step lazy: defer while the next position has a strictly longer match
+            while (pos + 5 <= src_len) {
+                let is i64 as p1 = pos + 1;
+                let is i64 as h1 = ((cast(i64, src[p1]) << 11) ^ (cast(i64, src[p1 + 1]) << 7)
+                                   ^ (cast(i64, src[p1 + 2]) << 3) ^ cast(i64, src[p1 + 3])) & (HSIZE - 1);
+                prev[p1] = head[h1]; head[h1] = p1; if (p1 > hins) { hins = p1; }
+                let is i64 as d1 with mut = 0;
+                let is i64 as l1 = _bmatch(src, p1, src_len, prev, &d1);
+                if (l1 > bestLen) { pos = p1; bestLen = l1; bestDist = d1; }
+                else { break; }
+            }
             let is i64 as insRun with mut = pos - anchor;
             let is i64 as a with mut = anchor;
             while (a < pos) { lits[nlit] = src[a]; nlit = nlit + 1; a = a + 1; }
             let is i64 as copyLen with mut = bestLen;
-            // (insHigh=0, cpyHigh=2) has no command symbol: extend the insert to
-            // 10 (insHigh=1) by emitting the first match bytes as literals, so a
-            // single insert-and-copy command covers the whole match.
             let is i64 as ccode = _copy_code_local(cpyOff, copyLen);
             let is i64 as icode = _copy_code_local2(insOff, insRun);
             if ((icode >> 3) == 0 && (ccode >> 3) == 2) {
@@ -1370,18 +1388,16 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
                 insRun = 10; copyLen = copyLen - need;
             }
             cmInsRun[ncmd] = insRun; cmCopy[ncmd] = copyLen; cmDist[ncmd] = bestDist; ncmd = ncmd + 1;
-            let is i64 as k with mut = 1;
-            while (k < bestLen) {
-                if (pos + k + 4 <= src_len) {
-                    let is i64 as hk = ((cast(i64, src[pos + k]) << 11) ^ (cast(i64, src[pos + k + 1]) << 7)
-                                       ^ (cast(i64, src[pos + k + 2]) << 3) ^ cast(i64, src[pos + k + 3])) & (HSIZE - 1);
-                    prev[pos + k] = head[hk]; head[hk] = pos + k;
+            let is i64 as k with mut = pos + 1;
+            while (k < pos + bestLen) {
+                if (k > hins && k + 4 <= src_len) {
+                    let is i64 as hk = ((cast(i64, src[k]) << 11) ^ (cast(i64, src[k + 1]) << 7)
+                                       ^ (cast(i64, src[k + 2]) << 3) ^ cast(i64, src[k + 3])) & (HSIZE - 1);
+                    prev[k] = head[hk]; head[hk] = k; hins = k;
                 }
                 k = k + 1;
             }
             pos = pos + bestLen; anchor = pos;
-        } else {
-            pos = pos + 1;
         }
     }
     // trailing literals -> final insert-only command (only if any remain)
