@@ -880,71 +880,86 @@ fn _encode_seqs(llenA as *i64, mlenA as *i64, distA as *i64, nseq as i64, blk as
 // global head/prev (absolute positions) so matches can reference earlier
 // blocks (the zstd window spans blocks). Fills the sequence arrays and the
 // literals buffer; returns the sequence count.
+// Best match at pos (already inserted into the hash): explicit hash chain +
+// repeat-offset candidates, preferring a repeat unless the explicit match is
+// clearly longer. Returns the chosen length (0 if none) and sets distOut.
+fn _zstd_search(src as *u8, pos as i64, end as i64, prev as *i64, ring as *i64, litRun as i64, distOut as *i64) as i64 {
+    let is i64 as bestRepLen with mut = 0;
+    let is i64 as bestRepDist with mut = 0;
+    let is i64 as ci with mut = 0;
+    while (ci < 3) {
+        let is i64 as rd with mut = 0;
+        if (litRun > 0) { rd = ring[ci]; }
+        else { if (ci == 0) { rd = ring[1]; } else if (ci == 1) { rd = ring[2]; } else { rd = ring[0] - 1; } }
+        if (rd >= 1 && pos - rd >= 0) {
+            let is i64 as l with mut = 0;
+            while (pos + l < end) { if (src[pos - rd + l] != src[pos + l]) { break; } l = l + 1; }
+            if (l >= 3 && l > bestRepLen) { bestRepLen = l; bestRepDist = rd; }
+        }
+        ci = ci + 1;
+    }
+    let is i64 as bestLen with mut = 0;
+    let is i64 as bestDist with mut = 0;
+    let is i64 as cand with mut = prev[pos];
+    let is i64 as chain with mut = 0;
+    while (cand >= 0) {
+        if (chain >= 128) { break; }
+        let is i64 as l with mut = 0;
+        while (pos + l < end) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
+        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        cand = prev[cand];
+        chain = chain + 1;
+    }
+    if (bestRepLen >= 3 && bestLen < bestRepLen + 3) { distOut[0] = bestRepDist; return bestRepLen; }
+    if (bestLen >= 3) { distOut[0] = bestDist; return bestLen; }
+    return 0;
+}
+
 fn _find_sequences(src as *u8, start as i64, end as i64, head as *i64, prev as *i64,
                    llenA as *i64, mlenA as *i64, distA as *i64, litbuf as *bytes.Bytes) as i64 {
     let is i64 as HSIZE with imut = 32768;
     let is i64 as nseq with mut = 0;
     let is i64 as pos with mut = start;
     let is i64 as anchor with mut = start;
+    let is i64 as hins with mut = start - 1;              // highest position inserted so far
     let is [3]i64 as ring; ring[0] = _eo0; ring[1] = _eo1; ring[2] = _eo2;
     while (pos + 3 <= end) {
         let is i64 as h = ((cast(i64, src[pos]) << 10) ^ (cast(i64, src[pos + 1]) << 5)
                           ^ cast(i64, src[pos + 2])) & (HSIZE - 1);
-        let is i64 as cand with mut = head[h];
-        prev[pos] = cand;
-        head[h] = pos;
-        let is i64 as litRun = pos - anchor;
-        // best repeat-distance match (candidates depend on the literal run)
-        let is i64 as bestRepLen with mut = 0;
-        let is i64 as bestRepDist with mut = 0;
-        let is i64 as ci with mut = 0;
-        while (ci < 3) {
-            let is i64 as rd with mut = 0;
-            if (litRun > 0) { rd = ring[ci]; }
-            else { if (ci == 0) { rd = ring[1]; } else if (ci == 1) { rd = ring[2]; } else { rd = ring[0] - 1; } }
-            if (rd >= 1 && pos - rd >= 0) {
-                let is i64 as l with mut = 0;
-                while (pos + l < end) { if (src[pos - rd + l] != src[pos + l]) { break; } l = l + 1; }
-                if (l >= 3 && l > bestRepLen) { bestRepLen = l; bestRepDist = rd; }
-            }
-            ci = ci + 1;
-        }
-        // best explicit match (hash chain)
-        let is i64 as bestLen with mut = 0;
-        let is i64 as bestDist with mut = 0;
-        let is i64 as chain with mut = 0;
-        while (cand >= 0) {
-            if (chain >= 128) { break; }
-            let is i64 as l with mut = 0;
-            while (pos + l < end) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
-            if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
-            cand = prev[cand];
-            chain = chain + 1;
-        }
-        // prefer a repeat unless the explicit match is clearly longer (reps are cheap)
-        let is i64 as useLen with mut = 0;
+        prev[pos] = head[h]; head[h] = pos;
+        if (pos > hins) { hins = pos; }
         let is i64 as useDist with mut = 0;
-        if (bestRepLen >= 3 && bestLen < bestRepLen + 3) { useLen = bestRepLen; useDist = bestRepDist; }
-        else if (bestLen >= 3) { useLen = bestLen; useDist = bestDist; }
-        if (useLen >= 3) {
+        let is i64 as useLen with mut = _zstd_search(src, pos, end, prev, cast(*i64, &ring), pos - anchor, &useDist);
+        if (useLen < 3) { pos = pos + 1; }
+        else {
+            // 1-step lazy: defer while the next position has a strictly longer match
+            while (pos + 4 <= end) {
+                let is i64 as p1 = pos + 1;
+                let is i64 as h1 = ((cast(i64, src[p1]) << 10) ^ (cast(i64, src[p1 + 1]) << 5)
+                                   ^ cast(i64, src[p1 + 2])) & (HSIZE - 1);
+                prev[p1] = head[h1]; head[h1] = p1;
+                if (p1 > hins) { hins = p1; }
+                let is i64 as d1 with mut = 0;
+                let is i64 as l1 = _zstd_search(src, p1, end, prev, cast(*i64, &ring), p1 - anchor, &d1);
+                if (l1 > useLen) { pos = p1; useLen = l1; useDist = d1; }
+                else { break; }
+            }
+            let is i64 as litRun = pos - anchor;
             if (litRun > 0) { bytes.bytes_append(litbuf, cast(*u8, cast(i64, src) + anchor), litRun); }
             llenA[nseq] = litRun; mlenA[nseq] = useLen; distA[nseq] = useDist;
             nseq = nseq + 1;
-            _zstd_rep(useDist, litRun, cast(*i64, &ring));   // keep the matcher ring in sync
-            let is i64 as k with mut = 1;
-            while (k < useLen) {
-                if (pos + k + 3 <= end) {
-                    let is i64 as hk = ((cast(i64, src[pos + k]) << 10) ^ (cast(i64, src[pos + k + 1]) << 5)
-                                       ^ cast(i64, src[pos + k + 2])) & (HSIZE - 1);
-                    prev[pos + k] = head[hk];
-                    head[hk] = pos + k;
+            _zstd_rep(useDist, litRun, cast(*i64, &ring));
+            let is i64 as k with mut = pos + 1;
+            while (k < pos + useLen) {
+                if (k > hins && k + 3 <= end) {
+                    let is i64 as hk = ((cast(i64, src[k]) << 10) ^ (cast(i64, src[k + 1]) << 5)
+                                       ^ cast(i64, src[k + 2])) & (HSIZE - 1);
+                    prev[k] = head[hk]; head[hk] = k; hins = k;
                 }
                 k = k + 1;
             }
             pos = pos + useLen;
             anchor = pos;
-        } else {
-            pos = pos + 1;
         }
     }
     if (anchor < end) { bytes.bytes_append(litbuf, cast(*u8, cast(i64, src) + anchor), end - anchor); }
