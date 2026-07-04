@@ -218,19 +218,10 @@ fn _u64_shr(a as u64, n as i64) as u64 { return a >> cast(u64, n); }   // logica
 fn _u64_mul(a as u64, b as u64) as u64 { return a * b; }
 
 fn _rotl64u(a as u64, r as i64) as u64 {
-    let is u64 as xl = _u64_shl(a, r);
-    let is u64 as xr = _u64_shr(a, 64 - r);
-    return _u64_or(xl, xr);
+    return (a << cast(u64, r)) | (a >> cast(u64, 64 - r));
 }
 fn _xx64_rd64u(buf as *u8, off as i64) as u64 {
-    let is u64 as v with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < 8) {
-        let is u64 as b = cast(u64, cast(i64, buf[off + i]));
-        v = _u64_or(v, _u64_shl(b, i * 8));
-        i = i + 1;
-    }
-    return v;
+    return cast(u64, cast(*i64, cast(i64, buf) + off)[0]);   // one little-endian 64-bit load
 }
 fn _xx64_rdu32(buf as *u8, off as i64) as u64 {
     return cast(u64, cast(i64, buf[off])
@@ -246,38 +237,38 @@ fn _XXP64_4() as u64 { return cast(u64, cast(i64, 9650029242287828579)); }
 fn _XXP64_5() as u64 { return cast(u64, cast(i64, 2870177450012600261)); }
 
 fn _xx64_roundu(acc as u64, input as u64) as u64 {
-    let is u64 as a with mut = _u64_add(acc, _u64_mul(input, _XXP64_2()));
-    a = _rotl64u(a, 31);
-    return _u64_mul(a, _XXP64_1());
+    let is u64 as a with mut = acc + (input * _XXP64_2());
+    a = (a << cast(u64, 31)) | (a >> cast(u64, 33));
+    return a * _XXP64_1();
 }
 fn _xx64_mergeRoundu(acc as u64, val as u64) as u64 {
-    let is u64 as a = _u64_xor(acc, _xx64_roundu(cast(u64, 0), val));
-    return _u64_add(_u64_mul(a, _XXP64_1()), _XXP64_4());
+    let is u64 as a = acc ^ _xx64_roundu(cast(u64, 0), val);
+    return (a * _XXP64_1()) + _XXP64_4();
 }
 fn _xx64_finalizeu(h as u64, buf as *u8, off as i64, len as i64) as u64 {
     let is u64 as hv with mut = h;
     let is i64 as p with mut = 0;
     while (p + 8 <= len) {
         let is u64 as k1 = _xx64_roundu(cast(u64, 0), _xx64_rd64u(buf, off + p));
-        hv = _u64_xor(hv, k1);
-        hv = _u64_add(_u64_mul(_rotl64u(hv, 27), _XXP64_1()), _XXP64_4());
+        hv = hv ^ k1;
+        hv = (_rotl64u(hv, 27) * _XXP64_1()) + _XXP64_4();
         p = p + 8;
     }
     if (p + 4 <= len) {
-        hv = _u64_xor(hv, _u64_mul(_xx64_rdu32(buf, off + p), _XXP64_1()));
-        hv = _u64_add(_u64_mul(_rotl64u(hv, 23), _XXP64_2()), _XXP64_3());
+        hv = hv ^ (_xx64_rdu32(buf, off + p) * _XXP64_1());
+        hv = (_rotl64u(hv, 23) * _XXP64_2()) + _XXP64_3();
         p = p + 4;
     }
     while (p < len) {
-        hv = _u64_xor(hv, _u64_mul(cast(u64, cast(i64, buf[off + p])), _XXP64_5()));
-        hv = _u64_mul(_rotl64u(hv, 11), _XXP64_1());
+        hv = hv ^ (cast(u64, cast(i64, buf[off + p])) * _XXP64_5());
+        hv = (_rotl64u(hv, 11) * _XXP64_1());
         p = p + 1;
     }
-    let is u64 as r with mut = _u64_xor(hv, _u64_shr(hv, 33));
-    r = _u64_mul(r, _XXP64_2());
-    r = _u64_xor(r, _u64_shr(r, 29));
-    r = _u64_mul(r, _XXP64_3());
-    r = _u64_xor(r, _u64_shr(r, 32));
+    let is u64 as r with mut = hv ^ (hv >> cast(u64, 33));
+    r = r * _XXP64_2();
+    r = r ^ (r >> cast(u64, 29));
+    r = r * _XXP64_3();
+    r = r ^ (r >> cast(u64, 32));
     return r;
 }
 fn xxhash64(buf as *u8, len as i64) as i64 {
