@@ -307,7 +307,10 @@ fn _buildHuff(group as *i64, tableIdx as i64, rootBits as i64, codeLengths as *i
 
 fn _readSym(group as *i64, tableIdx as i64) as i64 {
     let is i64 as off with mut = group[tableIdx];
-    let is i64 as v = _peek(16);
+    let is i64 as _bpp = _bitp >> 3;
+    let is i64 as v with mut = 0;
+    if (_bpp + 8 <= _slen) { v = cast(i64, cast(u64, cast(*i64, cast(i64, _src) + _bpp)[0]) >> cast(u64, _bitp & 7)) & 0xFFFF; }
+    else { v = _peek(16); }
     off = off + (v & 0xFF);
     let is i64 as entry = group[off];
     let is i64 as bits = entry >> 16;
