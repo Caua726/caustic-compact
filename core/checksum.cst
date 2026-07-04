@@ -125,12 +125,15 @@ fn adler32_update(adler as i64, buf as *u8, n as i64) as i64 {
     let is i64 as a with mut = adler & 0xFFFF;
     let is i64 as b with mut = (adler >> 16) & 0xFFFF;
     let is i64 as i with mut = 0;
-    while (i < n) {
-        a = a + cast(i64, buf[i]);
-        if (a >= _ADLER_MOD) { a = a - _ADLER_MOD; }
-        b = b + a;
-        if (b >= _ADLER_MOD) { b = b - _ADLER_MOD; }
-        i = i + 1;
+    let is i64 as rem with mut = n;
+    while (rem > 0) {                                   // defer the modulo (NMAX=5552)
+        let is i64 as k with mut = rem;
+        if (k > 5552) { k = 5552; }
+        rem = rem - k;
+        let is i64 as j with mut = 0;
+        while (j < k) { a = a + cast(i64, buf[i]); b = b + a; i = i + 1; j = j + 1; }
+        a = a % _ADLER_MOD;
+        b = b % _ADLER_MOD;
     }
     return (b << 16) | a;
 }

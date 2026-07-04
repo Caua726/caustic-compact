@@ -117,6 +117,83 @@ fn lzw_gif_decode(src as *u8, src_len as i64, min_code_size as i64,
     return rc;
 }
 
+// ---- TIFF-flavour LZW (MSB-first codes, "early change") -------------------
+// TIFF packs codes most-significant-bit first and widens the code one step
+// EARLIER than GIF (when next_code == (1<<width)-1). Fixed alphabet: 256
+// literals, 256=Clear, 257=EOI, dynamic codes from 258.
+fn lzw_tiff_decode(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
+    let is *i64 as prefix = cast(*i64, mem.core.mmap_anon(_LZW_MAX * 8));
+    let is *i64 as suffix = cast(*i64, mem.core.mmap_anon(_LZW_MAX * 8));
+    let is *i64 as firstb = cast(*i64, mem.core.mmap_anon(_LZW_MAX * 8));
+    let is *i64 as stack  = cast(*i64, mem.core.mmap_anon(_LZW_MAX * 8));
+    if (cast(i64, stack) <= 0) { return errno.Z_OOM; }
+    let is i64 as i with mut = 0;
+    while (i < 256) { firstb[i] = i; i = i + 1; }
+
+    // MSB-first bit reader state.
+    let is i64 as pos with mut = 0;
+    let is i64 as acc with mut = 0;
+    let is i64 as nbits with mut = 0;
+
+    let is i64 as width with mut = 9;
+    let is i64 as next_code with mut = 258;
+    let is i64 as prev with mut = 0 - 1;
+    let is i64 as rc with mut = 0;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        while (nbits < width) {
+            if (pos >= src_len) { go = 0; nbits = width; acc = acc << (width - nbits); }
+            else { acc = (acc << 8) | cast(i64, src[pos]); pos = pos + 1; nbits = nbits + 8; }
+        }
+        if (go == 1) {
+            let is i64 as code = (acc >> (nbits - width)) & ((1 << width) - 1);
+            nbits = nbits - width;
+            if (code == 257) { go = 0; }                    // EOI
+            else {
+                if (code == 256) {                          // Clear
+                    width = 9; next_code = 258; prev = 0 - 1;
+                } else {
+                    if (prev < 0) {
+                        if (code >= 256) { rc = errno.Z_BADHUFF; go = 0; }
+                        else { bytes.bytes_push(out, cast(u8, code)); prev = code; }
+                    } else {
+                        let is i64 as add_byte with mut = 0;
+                        if (code < next_code) {
+                            if (_emit(out, code, 256, prefix, suffix, stack) < 0) { rc = errno.Z_OOM; go = 0; }
+                            add_byte = firstb[code];
+                        } else {
+                            if (code != next_code) { rc = errno.Z_BADHUFF; go = 0; }
+                            else {
+                                if (_emit(out, prev, 256, prefix, suffix, stack) < 0) { rc = errno.Z_OOM; go = 0; }
+                                if (go == 1) { bytes.bytes_push(out, cast(u8, firstb[prev] & 255)); }
+                                add_byte = firstb[prev];
+                            }
+                        }
+                        if (go == 1) {
+                            if (next_code < _LZW_MAX) {
+                                prefix[next_code] = prev;
+                                suffix[next_code] = add_byte;
+                                firstb[next_code] = firstb[prev];
+                                next_code = next_code + 1;
+                                // early change: widen one code sooner than GIF.
+                                if (next_code == (1 << width) - 1) {
+                                    if (width < 12) { width = width + 1; }
+                                }
+                            }
+                            prev = code;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mem.core.munmap(cast(*u8, prefix), _LZW_MAX * 8);
+    mem.core.munmap(cast(*u8, suffix), _LZW_MAX * 8);
+    mem.core.munmap(cast(*u8, firstb), _LZW_MAX * 8);
+    mem.core.munmap(cast(*u8, stack),  _LZW_MAX * 8);
+    return rc;
+}
+
 // Append one variable-width code (LSB-first) to `out`. st = [bitbuf, nbits].
 fn _emit_code(out as *bytes.Bytes, code as i64, code_size as i64, st as *i64) as void {
     let is i64 as bitbuf with mut = st[0] | (code << st[1]);
