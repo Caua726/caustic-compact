@@ -133,6 +133,24 @@ fn _hash4(src as *u8, p as i64) as i64 {
 
 // Compress src[0,len) as one LZ4 block appended to out (greedy hash matcher).
 // Longest 4+ byte match for position ip via the hash chain (offset <= 65535).
+// Match length of src[a..] vs src[b..] up to maxLen, 8 bytes at a time.
+fn _match_run(src as *u8, a as i64, b as i64, maxLen as i64) as i64 {
+    let is i64 as l with mut = 0;
+    while (l + 8 <= maxLen) {
+        let is i64 as xa = cast(*i64, cast(i64, src) + a + l)[0];
+        let is i64 as xb = cast(*i64, cast(i64, src) + b + l)[0];
+        if (xa != xb) {
+            let is i64 as x with mut = xa ^ xb;
+            let is i64 as j with mut = 0;
+            while ((x & 0xFF) == 0) { x = x >> 8; j = j + 1; }
+            return l + j;
+        }
+        l = l + 8;
+    }
+    while (l < maxLen) { if (src[a + l] != src[b + l]) { break; } l = l + 1; }
+    return l;
+}
+
 fn _lz4_best(src as *u8, ip as i64, matchlimit as i64, head as *i64, prev as *i64, distOut as *i64) as i64 {
     let is i64 as cand with mut = prev[ip];   // ip is already inserted; skip it
     let is i64 as bestLen with mut = 0;
@@ -142,8 +160,7 @@ fn _lz4_best(src as *u8, ip as i64, matchlimit as i64, head as *i64, prev as *i6
         if (chain >= 64) { break; }
         if (src[cand] == src[ip] && src[cand + 1] == src[ip + 1]
             && src[cand + 2] == src[ip + 2] && src[cand + 3] == src[ip + 3]) {
-            let is i64 as l with mut = 4;
-            while (ip + l < matchlimit) { if (src[cand + l] != src[ip + l]) { break; } l = l + 1; }
+            let is i64 as l = _match_run(src, cand, ip, matchlimit - ip);
             if (l > bestLen) { bestLen = l; distOut[0] = ip - cand; }
         }
         cand = prev[cand];

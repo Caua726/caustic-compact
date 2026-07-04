@@ -130,10 +130,18 @@ fn _hash(src as *u8, pos as i64) as i64 {
 
 fn _match_len(src as *u8, a as i64, b as i64, maxlen as i64) as i64 {
     let is i64 as l with mut = 0;
-    while (l < maxlen) {
-        if (src[a + l] != src[b + l]) { break; }
-        l = l + 1;
+    while (l + 8 <= maxlen) {
+        let is i64 as xa = cast(*i64, cast(i64, src) + a + l)[0];
+        let is i64 as xb = cast(*i64, cast(i64, src) + b + l)[0];
+        if (xa != xb) {
+            let is i64 as x with mut = xa ^ xb;
+            let is i64 as j with mut = 0;
+            while ((x & 0xFF) == 0) { x = x >> 8; j = j + 1; }
+            return l + j;
+        }
+        l = l + 8;
     }
+    while (l < maxlen) { if (src[a + l] != src[b + l]) { break; } l = l + 1; }
     return l;
 }
 
