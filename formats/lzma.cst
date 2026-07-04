@@ -509,6 +509,45 @@ fn _find_match(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64 {
     return bestLen;
 }
 
+
+// Best match at pos WITHOUT inserting pos into the hash (for lazy lookahead).
+fn _find_match_peek(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64 {
+    if (pos + 2 >= slen) { return 0; }
+    let is i64 as h = ((cast(i64, src[pos]) << 16) ^ (cast(i64, src[pos + 1]) << 8)
+                       ^ cast(i64, src[pos + 2])) & 0xFFFFF;
+    let is i64 as cand with mut = _ehead[h];
+    let is i64 as bestLen with mut = 0;
+    let is i64 as bestDist with mut = 0;
+    let is i64 as chain with mut = 0;
+    let is i64 as maxLen with mut = slen - pos;
+    if (maxLen > 273) { maxLen = 273; }
+    while (cand >= 0) {
+        if (pos - cand > 16777216) { break; }
+        if (chain >= 64) { break; }
+        let is i64 as l with mut = 0;
+        while (l < maxLen) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
+        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        cand = _eprev[cand & 0xFFFFF];
+        chain = chain + 1;
+    }
+    distOut[0] = bestDist;
+    return bestLen;
+}
+
+// Longest repeat-distance match at pos over the current rep0..rep3.
+fn _best_rep_len(lz as *Lzma, src as *u8, pos as i64, slen as i64) as i64 {
+    let is i64 as best with mut = 0;
+    let is i64 as ri with mut = 0;
+    while (ri < 4) {
+        let is i64 as rd with mut = 0;
+        if (ri == 0) { rd = lz.rep0 + 1; } else if (ri == 1) { rd = lz.rep1 + 1; }
+        else if (ri == 2) { rd = lz.rep2 + 1; } else { rd = lz.rep3 + 1; }
+        if (pos >= rd) { let is i64 as rl = _rep_len(src, pos, slen, rd); if (rl > best) { best = rl; } }
+        ri = ri + 1;
+    }
+    return best;
+}
+
 // Match length at pos for a given back-distance (a repeated distance).
 fn _rep_len(src as *u8, pos as i64, slen as i64, dist as i64) as i64 {
     let is i64 as maxLen with mut = slen - pos;
@@ -551,6 +590,15 @@ fn _lzma_encode(lz as *Lzma, src as *u8, slen as i64, out as *bytes.Bytes) as i6
         let is i64 as choice with mut = 0;   // 0=literal 1=fresh-match 2=rep-match
         if (bestRepLen >= 2 && mlen < bestRepLen + 2) { choice = 2; }
         else if (mlen >= 2 && (mlen >= 3 || dist < 512)) { choice = 1; }
+        // 1-step lazy: if the next position has a strictly longer match, defer
+        // this fresh match and emit a literal instead (reps stay committed).
+        if (choice == 1 && pos + 3 < slen) {
+            let is i64 as pd with mut = 0;
+            let is i64 as nextLen with mut = _find_match_peek(src, pos + 1, slen, &pd);
+            let is i64 as nextRep = _best_rep_len(lz, src, pos + 1, slen);
+            if (nextRep > nextLen) { nextLen = nextRep; }
+            if (nextLen > mlen) { choice = 0; }
+        }
         let is i64 as advLen with mut = 1;
         if (choice == 2) {
             _enc_bit(lz, lz.o_isMatch + (lz.state << 4) + posState, 1);
