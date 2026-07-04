@@ -30,4 +30,5 @@ use "formats/bzip2.cst"   as bzip2;
 use "formats/zstd.cst"    as zstd;
 use "formats/brotli.cst"  as brotli;
 use "formats/lzw.cst"     as lzw;
+use "entropy/rans.cst"    as rans;
 use "stream.cst" as stream;
