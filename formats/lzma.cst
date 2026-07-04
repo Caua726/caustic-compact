@@ -116,7 +116,13 @@ fn _dec_bit(lz as *Lzma, idx as i64) as i64 {
         lz.probs[idx] = v - (v >> 5);
         bit = 1;
     }
-    _normalize(lz);
+    if (lz.range < 0x1000000) {                     // inlined _normalize (hot path)
+        lz.range = (lz.range << 8) & 0xFFFFFFFF;
+        let is i64 as b with mut = 0;
+        if (lz.pos < lz.srclen) { b = cast(i64, lz.src[lz.pos]); }
+        lz.pos = lz.pos + 1;
+        lz.code = ((lz.code << 8) | b) & 0xFFFFFFFF;
+    }
     return bit;
 }
 
