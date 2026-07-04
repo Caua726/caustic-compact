@@ -481,6 +481,25 @@ fn _enc_literal(lz as *Lzma, src as *u8, pos as i64) as void {
 // greedy hash-chain match finder over src; returns best length (>=0), sets *distOut
 let is *i64 as _ehead with mut;
 let is *i64 as _eprev with mut;
+// Match length of src[a..] vs src[b..] up to maxLen, comparing 8 bytes at a
+// time (a+l and b+l stay in-bounds because l+8 <= maxLen <= slen-max(a,b)).
+fn _match_run(src as *u8, a as i64, b as i64, maxLen as i64) as i64 {
+    let is i64 as l with mut = 0;
+    while (l + 8 <= maxLen) {
+        let is i64 as xa = cast(*i64, cast(i64, src) + a + l)[0];
+        let is i64 as xb = cast(*i64, cast(i64, src) + b + l)[0];
+        if (xa != xb) {
+            let is i64 as x with mut = xa ^ xb;
+            let is i64 as j with mut = 0;
+            while ((x & 0xFF) == 0) { x = x >> 8; j = j + 1; }
+            return l + j;
+        }
+        l = l + 8;
+    }
+    while (l < maxLen) { if (src[a + l] != src[b + l]) { break; } l = l + 1; }
+    return l;
+}
+
 fn _find_match(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64 {
     if (pos + 2 >= slen) { return 0; }
     let is i64 as h = ((cast(i64, src[pos]) << 16) ^ (cast(i64, src[pos + 1]) << 8)
@@ -496,12 +515,8 @@ fn _find_match(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64 {
     while (cand >= 0) {
         if (pos - cand > 16777216) { break; }
         if (chain >= 64) { break; }
-        let is i64 as l with mut = 0;
-        while (l < maxLen) {
-            if (src[cand + l] != src[pos + l]) { break; }
-            l = l + 1;
-        }
-        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        let is i64 as l = _match_run(src, cand, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cand; if (l >= maxLen) { break; } }
         cand = _eprev[cand & 0xFFFFF];
         chain = chain + 1;
     }
@@ -524,9 +539,8 @@ fn _find_match_peek(src as *u8, pos as i64, slen as i64, distOut as *i64) as i64
     while (cand >= 0) {
         if (pos - cand > 16777216) { break; }
         if (chain >= 64) { break; }
-        let is i64 as l with mut = 0;
-        while (l < maxLen) { if (src[cand + l] != src[pos + l]) { break; } l = l + 1; }
-        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        let is i64 as l = _match_run(src, cand, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cand; if (l >= maxLen) { break; } }
         cand = _eprev[cand & 0xFFFFF];
         chain = chain + 1;
     }
@@ -552,12 +566,7 @@ fn _best_rep_len(lz as *Lzma, src as *u8, pos as i64, slen as i64) as i64 {
 fn _rep_len(src as *u8, pos as i64, slen as i64, dist as i64) as i64 {
     let is i64 as maxLen with mut = slen - pos;
     if (maxLen > 273) { maxLen = 273; }
-    let is i64 as l with mut = 0;
-    while (l < maxLen) {
-        if (src[pos - dist + l] != src[pos + l]) { break; }
-        l = l + 1;
-    }
-    return l;
+    return _match_run(src, pos - dist, pos, maxLen);
 }
 
 // Encode raw LZMA into out (props lc=3 lp=0 pb=2). Known-size, no end marker.
