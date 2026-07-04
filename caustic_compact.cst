@@ -29,4 +29,5 @@ use "formats/xz.cst"      as xz;
 use "formats/bzip2.cst"   as bzip2;
 use "formats/zstd.cst"    as zstd;
 use "formats/brotli.cst"  as brotli;
+use "formats/lzw.cst"     as lzw;
 use "stream.cst" as stream;

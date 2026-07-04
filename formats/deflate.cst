@@ -250,8 +250,11 @@ fn _deflate_tokenize(src as *u8, src_len as i64, tkLen as *i64, tkVal as *i64) a
             while (cand >= 0) {
                 if (pos - cand > _WSIZE) { break; }
                 if (chain >= _MAX_CHAIN) { break; }
-                let is i64 as l = _match_len(src, cand, pos, maxl);
-                if (l > curLen) { curLen = l; curDist = pos - cand; if (l >= maxl) { break; } }
+                // quick reject: only compare candidates that can beat the current best
+                if (curLen == 0 || src[cand + curLen] == src[pos + curLen]) {
+                    let is i64 as l = _match_len(src, cand, pos, maxl);
+                    if (l > curLen) { curLen = l; curDist = pos - cand; if (l >= maxl) { break; } }
+                }
                 cand = prev[cand]; chain = chain + 1;
             }
             prev[pos] = head[h]; head[h] = pos;
