@@ -447,6 +447,37 @@ fn _mk_lengths(len as *i64, freq as *i64, alphaSize as i64) as void {
     mem.core.munmap(cast(*u8, parent), 520 * 8);
 }
 
+// Sift-down for heapsort of sa[lo..lo+cnt) by second key rank[(sa[k]+kk)%n].
+fn _hsdown(sa as *i64, lo as i64, start as i64, cnt as i64, rank as *i64, kk as i64, n as i64) as void {
+    let is i64 as root with mut = start;
+    while (root * 2 + 1 < cnt) {
+        let is i64 as child with mut = root * 2 + 1;
+        let is i64 as tc with mut = sa[lo + child] + kk; if (tc >= n) { tc = tc - n; }
+        let is i64 as kc with mut = rank[tc];
+        if (child + 1 < cnt) {
+            let is i64 as t2 with mut = sa[lo + child + 1] + kk; if (t2 >= n) { t2 = t2 - n; }
+            if (rank[t2] > kc) { child = child + 1; kc = rank[t2]; }
+        }
+        let is i64 as tr with mut = sa[lo + root] + kk; if (tr >= n) { tr = tr - n; }
+        if (rank[tr] < kc) {
+            let is i64 as tmp = sa[lo + root]; sa[lo + root] = sa[lo + child]; sa[lo + child] = tmp;
+            root = child;
+        } else { return; }
+    }
+}
+// In-place heapsort of sa[lo..hi) by second key (ascending); ties are fine.
+fn _hsort2(sa as *i64, lo as i64, hi as i64, rank as *i64, kk as i64, n as i64) as void {
+    let is i64 as cnt = hi - lo;
+    let is i64 as i with mut = cnt / 2 - 1;
+    while (i >= 0) { _hsdown(sa, lo, i, cnt, rank, kk, n); i = i - 1; }
+    i = cnt - 1;
+    while (i > 0) {
+        let is i64 as tmp = sa[lo]; sa[lo] = sa[lo + i]; sa[lo + i] = tmp;
+        _hsdown(sa, lo, 0, i, rank, kk, n);
+        i = i - 1;
+    }
+}
+
 // stable counting sort of sa[] (length n) by key[sa[i]] in [0, mk]; into dst.
 fn _csort(sa as *i64, dst as *i64, key as *i64, n as i64, cnt as *i64, mk as i64) as void {
     let is i64 as i with mut = 0;
@@ -500,12 +531,22 @@ fn _emit_bzip2_block(src as *u8, src_len as i64, w as *BzWr) as i64 {
     while (i < n) { sa[i] = i; rank[i] = cast(i64, rle[i]); i = i + 1; }
     let is i64 as kk with mut = 1;
     while (kk < n) {
-        // sort by second key rank[(i+kk)%n]
-        i = 0;
-        while (i < n) { let is i64 as idx with mut = i + kk; if (idx >= n) { idx = idx - n; } key[i] = rank[idx]; i = i + 1; }
-        _csort(sa, sa2, key, n, cnt, maxRank);
-        // then by first key rank[i]
-        _csort(sa2, sa, rank, n, cnt, maxRank);
+        if (kk == 1 || maxRank * 2 < n) {
+            // counting sort while groups are still large (protects repetitive data)
+            i = 0;
+            while (i < n) { let is i64 as idx with mut = i + kk; if (idx >= n) { idx = idx - n; } key[i] = rank[idx]; i = i + 1; }
+            _csort(sa, sa2, key, n, cnt, maxRank);
+            _csort(sa2, sa, rank, n, cnt, maxRank);
+        } else {
+            // singletons dominate: only re-sort non-singleton groups (Manber-Myers skip)
+            i = 0;
+            while (i < n) {
+                let is i64 as j with mut = i + 1;
+                while (j < n) { if (rank[sa[j]] != rank[sa[i]]) { break; } j = j + 1; }
+                if (j - i > 1) { _hsort2(sa, i, j, rank, kk, n); }
+                i = j;
+            }
+        }
         // recompute ranks
         nrank[sa[0]] = 0;
         let is i64 as r with mut = 0;
