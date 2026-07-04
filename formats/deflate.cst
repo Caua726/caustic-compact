@@ -242,7 +242,7 @@ fn _deflate_tokenize(src as *u8, src_len as i64, tkLen as *i64, tkVal as *i64) a
         let is i64 as curLen with mut = 0;
         let is i64 as curDist with mut = 0;
         if (pos + 3 <= src_len) {
-            let is i64 as h = _hash(src, pos);
+            let is i64 as h = (((cast(i64, src[pos]) << 10) ^ (cast(i64, src[pos + 1]) << 5) ^ cast(i64, src[pos + 2])) & 0x7FFF);
             let is i64 as cand with mut = head[h];
             let is i64 as chain with mut = 0;
             let is i64 as maxl with mut = src_len - pos;
@@ -266,7 +266,7 @@ fn _deflate_tokenize(src as *u8, src_len as i64, tkLen as *i64, tkVal as *i64) a
                 let is i64 as matchEnd = (pos - 1) + prevLen;
                 let is i64 as k with mut = pos + 1;
                 while (k < matchEnd) {
-                    if (k + 3 <= src_len) { let is i64 as hk = _hash(src, k); prev[k] = head[hk]; head[hk] = k; }
+                    if (k + 3 <= src_len) { let is i64 as hk = (((cast(i64, src[k]) << 10) ^ (cast(i64, src[k + 1]) << 5) ^ cast(i64, src[k + 2])) & 0x7FFF); prev[k] = head[hk]; head[hk] = k; }
                     k = k + 1;
                 }
                 pos = matchEnd;
