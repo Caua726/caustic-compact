@@ -119,7 +119,14 @@ fn _inflate_stored(br as *bitreader.BitReader, out as *bytes.Bytes) as i64 {
 // --- shared symbol loop for fixed/dynamic Huffman blocks ----------------
 fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
                           lit as *huffman.Huff, dist as *huffman.Huff) as i64 {
-    let is i64 as sym with mut = huffman.huff_decode(lit, br);
+    let is i64 as sym with mut = 0;
+    {
+        while (br.nbits < 9) { if (br.pos >= br.len) { break; } br.acc = br.acc | (cast(i64, br.src[br.pos]) << br.nbits); br.pos = br.pos + 1; br.nbits = br.nbits + 8; }
+        let is i64 as _e = lit.fast[br.acc & 511];
+        let is i64 as _l = _e >> 16;
+        if (_l > 0) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; sym = _e & 0xFFFF; }
+        else { sym = huffman.huff_decode(lit, br); }
+    }
     while (sym != 256) {
         if (sym < 0) { return sym; }
         if (sym < 256) {
@@ -130,7 +137,14 @@ fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
             let is i64 as eb = bitreader.br_get(br, LEXTRA[li]);
             if (eb < 0) { return errno.Z_EOF; }
             let is i64 as length = LBASE[li] + eb;
-            let is i64 as dsym = huffman.huff_decode(dist, br);
+            let is i64 as dsym with mut = 0;
+            {
+        while (br.nbits < 9) { if (br.pos >= br.len) { break; } br.acc = br.acc | (cast(i64, br.src[br.pos]) << br.nbits); br.pos = br.pos + 1; br.nbits = br.nbits + 8; }
+        let is i64 as _e = dist.fast[br.acc & 511];
+        let is i64 as _l = _e >> 16;
+        if (_l > 0) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; dsym = _e & 0xFFFF; }
+        else { dsym = huffman.huff_decode(dist, br); }
+    }
             if (dsym < 0) { return dsym; }
             if (dsym >= 30) { return errno.Z_BADDIST; }
             let is i64 as deb = bitreader.br_get(br, DEXTRA[dsym]);
@@ -139,7 +153,13 @@ fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
             let is i64 as cr = _lz_copy(out, distance, length);
             if (cr < 0) { return cr; }
         }
-        sym = huffman.huff_decode(lit, br);
+        {
+        while (br.nbits < 9) { if (br.pos >= br.len) { break; } br.acc = br.acc | (cast(i64, br.src[br.pos]) << br.nbits); br.pos = br.pos + 1; br.nbits = br.nbits + 8; }
+        let is i64 as _e = lit.fast[br.acc & 511];
+        let is i64 as _l = _e >> 16;
+        if (_l > 0) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; sym = _e & 0xFFFF; }
+        else { sym = huffman.huff_decode(lit, br); }
+    }
     }
     return 0;
 }
