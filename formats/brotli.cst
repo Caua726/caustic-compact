@@ -1335,8 +1335,10 @@ fn _bmatch(src as *u8, pos as i64, src_len as i64, prev as *i64, distOut as *i64
     let is i64 as chain with mut = 0;
     while (cand >= 0) {
         if (chain >= 128) { break; }
-        let is i64 as l = _match_run(src, cand, pos, src_len - pos);
-        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        if (bestLen == 0 || src[cand + bestLen] == src[pos + bestLen]) {
+            let is i64 as l = _match_run(src, cand, pos, src_len - pos);
+            if (l > bestLen) { bestLen = l; bestDist = pos - cand; if (pos + bestLen >= src_len) { break; } }
+        }
         cand = prev[cand];
         chain = chain + 1;
     }

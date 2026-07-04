@@ -925,8 +925,11 @@ fn _zstd_search(src as *u8, pos as i64, end as i64, prev as *i64, ring as *i64, 
     let is i64 as chain with mut = 0;
     while (cand >= 0) {
         if (chain >= 128) { break; }
-        let is i64 as l = _match_run(src, cand, pos, end - pos);
-        if (l > bestLen) { bestLen = l; bestDist = pos - cand; }
+        // quick reject: skip candidates that cannot beat the current best
+        if (bestLen == 0 || src[cand + bestLen] == src[pos + bestLen]) {
+            let is i64 as l = _match_run(src, cand, pos, end - pos);
+            if (l > bestLen) { bestLen = l; bestDist = pos - cand; if (pos + bestLen >= end) { break; } }
+        }
         cand = prev[cand];
         chain = chain + 1;
     }
