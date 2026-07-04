@@ -146,7 +146,6 @@ fn _deflate_fixed(bw as *bitwriter.BitWriter, src as *u8, src_len as i64) as i64
         let is *i64 as prev = cast(*i64, mem.core.mmap_anon(src_len * 8));
         if (cast(i64, head) <= 0 || cast(i64, prev) <= 0) { return errno.Z_OOM; }
         mem.core.memset(cast(*u8, head), cast(i32, 0xFF), _HASH_SIZE * 8);  // all -1
-        mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), src_len * 8);
 
         let is i64 as pos with mut = 0;
         while (pos < src_len) {
@@ -226,7 +225,6 @@ fn _deflate_tokenize(src as *u8, src_len as i64, tkLen as *i64, tkVal as *i64) a
     let is *i64 as head = cast(*i64, mem.core.mmap_anon(_HASH_SIZE * 8));
     let is *i64 as prev = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
     mem.core.memset(cast(*u8, head), cast(i32, 0xFF), _HASH_SIZE * 8);
-    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (src_len + 1) * 8);
     let is i64 as ntok with mut = 0;
     let is i64 as prevLen with mut = 2;
     let is i64 as prevDist with mut = 0;

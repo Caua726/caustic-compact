@@ -156,7 +156,6 @@ fn _lz4_enc_block(src as *u8, len as i64, out as *bytes.Bytes) as i64 {
     let is *i64 as head = cast(*i64, mem.core.mmap_anon(65536 * 8));
     let is *i64 as prev = cast(*i64, mem.core.mmap_anon((len + 1) * 8));
     mem.core.memset(cast(*u8, head), cast(i32, 0xFF), 65536 * 8);   // -1
-    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (len + 1) * 8);
     let is i64 as anchor with mut = 0;
     let is i64 as ip with mut = 0;
     let is i64 as mflimit = len - 12;
@@ -164,7 +163,8 @@ fn _lz4_enc_block(src as *u8, len as i64, out as *bytes.Bytes) as i64 {
 
     if (len >= 13) {
         ip = 1;
-        // insert position 0 so it can be referenced
+        // insert position 0 so it can be referenced (prev[0] terminates its chain)
+        prev[0] = 0 - 1;
         head[_hash4(src, 0)] = 0;
         while (ip < mflimit) {
             let is i64 as h0 = _hash4(src, ip);

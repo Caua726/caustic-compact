@@ -1343,7 +1343,6 @@ fn _brotli_huff2(src as *u8, src_len as i64, out as *bytes.Bytes, level as i64) 
     let is *i64 as head = cast(*i64, mem.core.mmap_anon(HSIZE * 8));
     let is *i64 as prev = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
     mem.core.memset(cast(*u8, head), cast(i32, 0xFF), HSIZE * 8);
-    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (src_len + 1) * 8);
     let is i64 as maxCmd = src_len + 16;
     let is *i64 as cmInsRun = _ia(maxCmd);
     let is *i64 as cmCopy = _ia(maxCmd);
