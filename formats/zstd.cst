@@ -459,6 +459,10 @@ fn _match_copy(out as *bytes.Bytes, offset as i64, mlen as i64) as i64 {
     let is i64 as sp with mut = out.len - offset;
     let is i64 as dp with mut = out.len;
     let is i64 as e = out.len + mlen;
+        let is i64 as _p = cast(i64, out.ptr);
+        if (offset >= 8) {
+            while (dp + 8 <= e) { cast(*i64, _p + dp)[0] = cast(*i64, _p + sp)[0]; sp = sp + 8; dp = dp + 8; }
+        }
     while (dp < e) { out.ptr[dp] = out.ptr[sp]; sp = sp + 1; dp = dp + 1; }
     out.len = e;
     return 0;

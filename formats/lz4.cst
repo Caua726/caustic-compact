@@ -65,11 +65,11 @@ fn _lz4_block(src as *u8, off as i64, blen as i64, out as *bytes.Bytes) as i64 {
         let is i64 as s with mut = out.len - offset;
         let is i64 as d with mut = out.len;
         let is i64 as e = out.len + matchlen;
-        while (d < e) {
-            out.ptr[d] = out.ptr[s];
-            s = s + 1;
-            d = d + 1;
+        let is i64 as _p = cast(i64, out.ptr);
+        if (offset >= 8) {
+            while (d + 8 <= e) { cast(*i64, _p + d)[0] = cast(*i64, _p + s)[0]; s = s + 8; d = d + 8; }
         }
+        while (d < e) { out.ptr[d] = out.ptr[s]; s = s + 1; d = d + 1; }
         out.len = e;
     }
     return 0;
