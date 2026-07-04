@@ -219,17 +219,22 @@ fn _cl_init() as void {
     _cl_ready = 1;
 }
 
-// Count frequencies for a fixed-Huffman match run (no actual encoding here).
-fn _dyn_collect(src as *u8, src_len as i64, litFreq as *i64, distFreq as *i64) as i64 {
+// Tokenize src into literals/matches with a hash-chain matcher + 1-step lazy
+// matching (defer a match when the next position has a strictly longer one).
+// tkLen[i]==0 -> literal (byte in tkVal[i]); tkLen[i]>=3 -> match (dist in tkVal[i]).
+fn _deflate_tokenize(src as *u8, src_len as i64, tkLen as *i64, tkVal as *i64) as i64 {
     let is *i64 as head = cast(*i64, mem.core.mmap_anon(_HASH_SIZE * 8));
-    let is *i64 as prev = cast(*i64, mem.core.mmap_anon(src_len * 8));
+    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
     mem.core.memset(cast(*u8, head), cast(i32, 0xFF), _HASH_SIZE * 8);
-    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), src_len * 8);
-
+    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), (src_len + 1) * 8);
+    let is i64 as ntok with mut = 0;
+    let is i64 as prevLen with mut = 2;
+    let is i64 as prevDist with mut = 0;
+    let is i64 as matchAvail with mut = 0;
     let is i64 as pos with mut = 0;
     while (pos < src_len) {
-        let is i64 as best_len with mut = 0;
-        let is i64 as best_dist with mut = 0;
+        let is i64 as curLen with mut = 0;
+        let is i64 as curDist with mut = 0;
         if (pos + 3 <= src_len) {
             let is i64 as h = _hash(src, pos);
             let is i64 as cand with mut = head[h];
@@ -240,38 +245,59 @@ fn _dyn_collect(src as *u8, src_len as i64, litFreq as *i64, distFreq as *i64) a
                 if (pos - cand > _WSIZE) { break; }
                 if (chain >= _MAX_CHAIN) { break; }
                 let is i64 as l = _match_len(src, cand, pos, maxl);
-                if (l > best_len) {
-                    best_len = l; best_dist = pos - cand;
-                    if (l >= maxl) { break; }
-                }
-                cand = prev[cand];
-                chain = chain + 1;
+                if (l > curLen) { curLen = l; curDist = pos - cand; if (l >= maxl) { break; } }
+                cand = prev[cand]; chain = chain + 1;
             }
-            prev[pos] = head[h];
-            head[h] = pos;
+            prev[pos] = head[h]; head[h] = pos;
         }
-        if (best_len >= 3) {
-            litFreq[257 + _length_code(best_len)] = litFreq[257 + _length_code(best_len)] + 1;
-            distFreq[_dist_code(best_dist)] = distFreq[_dist_code(best_dist)] + 1;
-            let is i64 as k with mut = 1;
-            while (k < best_len) {
-                if (pos + k + 3 <= src_len) {
-                    let is i64 as hk = _hash(src, pos + k);
-                    prev[pos + k] = head[hk];
-                    head[hk] = pos + k;
+        if (matchAvail == 1) {
+            if (curLen <= prevLen) {
+                // the deferred match (at pos-1) wins: commit it
+                tkLen[ntok] = prevLen; tkVal[ntok] = prevDist; ntok = ntok + 1;
+                let is i64 as matchEnd = (pos - 1) + prevLen;
+                let is i64 as k with mut = pos + 1;
+                while (k < matchEnd) {
+                    if (k + 3 <= src_len) { let is i64 as hk = _hash(src, k); prev[k] = head[hk]; head[hk] = k; }
+                    k = k + 1;
                 }
-                k = k + 1;
+                pos = matchEnd;
+                matchAvail = 0;
+            } else {
+                // current match is longer: emit a literal for pos-1 and defer again
+                tkLen[ntok] = 0; tkVal[ntok] = cast(i64, src[pos - 1]); ntok = ntok + 1;
+                prevLen = curLen; prevDist = curDist;
+                pos = pos + 1;
             }
-            pos = pos + best_len;
         } else {
-            litFreq[cast(i64, src[pos])] = litFreq[cast(i64, src[pos])] + 1;
-            pos = pos + 1;
+            if (curLen >= 3) {
+                prevLen = curLen; prevDist = curDist; matchAvail = 1;
+                pos = pos + 1;
+            } else {
+                tkLen[ntok] = 0; tkVal[ntok] = cast(i64, src[pos]); ntok = ntok + 1;
+                pos = pos + 1;
+            }
         }
     }
-    litFreq[256] = litFreq[256] + 1;   // end-of-block
+    if (matchAvail == 1) { tkLen[ntok] = 0; tkVal[ntok] = cast(i64, src[pos - 1]); ntok = ntok + 1; }
     mem.core.munmap(cast(*u8, head), _HASH_SIZE * 8);
-    mem.core.munmap(cast(*u8, prev), src_len * 8);
-    return 0;
+    mem.core.munmap(cast(*u8, prev), (src_len + 1) * 8);
+    return ntok;
+}
+
+// Count literal/length and distance frequencies from a token stream.
+fn _dyn_collect_tok(tkLen as *i64, tkVal as *i64, ntok as i64, litFreq as *i64, distFreq as *i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < ntok) {
+        if (tkLen[i] == 0) {
+            litFreq[tkVal[i]] = litFreq[tkVal[i]] + 1;
+        } else {
+            let is i64 as li = _length_code(tkLen[i]);
+            litFreq[257 + li] = litFreq[257 + li] + 1;
+            distFreq[_dist_code(tkVal[i])] = distFreq[_dist_code(tkVal[i])] + 1;
+        }
+        i = i + 1;
+    }
+    litFreq[256] = litFreq[256] + 1;   // end-of-block
 }
 
 // Build length-limited code lengths (RFC 1951 §3.2.7 lite: standard Huffman
@@ -472,7 +498,7 @@ fn _pad_tree(lengths as *i64, nsym as i64) as void {
 }
 
 // Emit a dynamic block. litLen/dstFre are populated by _dyn_collect.
-fn _deflate_dynamic(bw as *bitwriter.BitWriter, src as *u8, src_len as i64, litFreq as *i64, distFreq as *i64) as i64 {
+fn _deflate_dynamic(bw as *bitwriter.BitWriter, tkLen as *i64, tkVal as *i64, ntok as i64, litFreq as *i64, distFreq as *i64) as i64 {
     let is *i64 as llLen = _tab(288);
     let is *i64 as ddLen = _tab(30);
     _build_lengths(litFreq, 286, 15, llLen);
@@ -532,55 +558,24 @@ fn _deflate_dynamic(bw as *bitwriter.BitWriter, src as *u8, src_len as i64, litF
         i = i + 1;
     }
 
-    // Emit compressed data using dynamic tables
-    let is *i64 as head = cast(*i64, mem.core.mmap_anon(_HASH_SIZE * 8));
-    let is *i64 as prev = cast(*i64, mem.core.mmap_anon(src_len * 8));
-    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), _HASH_SIZE * 8);
-    mem.core.memset(cast(*u8, prev), cast(i32, 0xFF), src_len * 8);
-    let is i64 as pos with mut = 0;
-    while (pos < src_len) {
-        let is i64 as best_len with mut = 0;
-        let is i64 as best_dist with mut = 0;
-        if (pos + 3 <= src_len) {
-            let is i64 as h = _hash(src, pos);
-            let is i64 as cand with mut = head[h];
-            let is i64 as chain with mut = 0;
-            let is i64 as maxl with mut = src_len - pos;
-            if (maxl > 258) { maxl = 258; }
-            while (cand >= 0) {
-                if (pos - cand > _WSIZE) { break; }
-                if (chain >= _MAX_CHAIN) { break; }
-                let is i64 as l = _match_len(src, cand, pos, maxl);
-                if (l > best_len) { best_len = l; best_dist = pos - cand; if (l >= maxl) { break; } }
-                cand = prev[cand]; chain = chain + 1;
-            }
-            prev[pos] = head[h]; head[h] = pos;
-        }
-        if (best_len >= 3) {
-            let is i64 as li = _length_code(best_len);
-            bitwriter.bw_huff(bw, llCode[257 + li], llLen[257 + li]);
-            if (LEXTRA[li] > 0) { bitwriter.bw_bits(bw, best_len - LBASE[li], LEXTRA[li]); }
-            let is i64 as dd = _dist_code(best_dist);
-            bitwriter.bw_huff(bw, ddCode[dd], ddLen[dd]);
-            if (DEXTRA[dd] > 0) { bitwriter.bw_bits(bw, best_dist - DBASE[dd], DEXTRA[dd]); }
-            let is i64 as k with mut = 1;
-            while (k < best_len) {
-                if (pos + k + 3 <= src_len) {
-                    let is i64 as hk = _hash(src, pos + k);
-                    prev[pos + k] = head[hk]; head[hk] = pos + k;
-                }
-                k = k + 1;
-            }
-            pos = pos + best_len;
+    // Emit compressed data from the precomputed token stream
+    let is i64 as ti with mut = 0;
+    while (ti < ntok) {
+        if (tkLen[ti] == 0) {
+            let is i64 as b = tkVal[ti];
+            bitwriter.bw_huff(bw, llCode[b], llLen[b]);
         } else {
-            bitwriter.bw_huff(bw, llCode[cast(i64, src[pos])], llLen[cast(i64, src[pos])]);
-            pos = pos + 1;
+            let is i64 as li = _length_code(tkLen[ti]);
+            bitwriter.bw_huff(bw, llCode[257 + li], llLen[257 + li]);
+            if (LEXTRA[li] > 0) { bitwriter.bw_bits(bw, tkLen[ti] - LBASE[li], LEXTRA[li]); }
+            let is i64 as dd = _dist_code(tkVal[ti]);
+            bitwriter.bw_huff(bw, ddCode[dd], ddLen[dd]);
+            if (DEXTRA[dd] > 0) { bitwriter.bw_bits(bw, tkVal[ti] - DBASE[dd], DEXTRA[dd]); }
         }
+        ti = ti + 1;
     }
     bitwriter.bw_huff(bw, llCode[256], llLen[256]);       // end-of-block
     bitwriter.bw_align(bw);
-    mem.core.munmap(cast(*u8, head), _HASH_SIZE * 8);
-    mem.core.munmap(cast(*u8, prev), src_len * 8);
     mem.core.munmap(cast(*u8, llLen), 288 * 8);
     mem.core.munmap(cast(*u8, ddLen), 30 * 8);
     mem.core.munmap(cast(*u8, llCode), 288 * 8);
@@ -594,12 +589,17 @@ fn _deflate_dynamic(bw as *bitwriter.BitWriter, src as *u8, src_len as i64, litF
 }
 
 fn _deflate_dynamic_entry(bw as *bitwriter.BitWriter, src as *u8, src_len as i64) as i64 {
+    let is *i64 as tkLen = _tab(src_len + 2);
+    let is *i64 as tkVal = _tab(src_len + 2);
+    let is i64 as ntok = _deflate_tokenize(src, src_len, tkLen, tkVal);
     let is *i64 as litFreq = _tab(286);
     let is *i64 as distFreq = _tab(30);
-    if (_dyn_collect(src, src_len, litFreq, distFreq) < 0) { return errno.Z_OOM; }
-    let is i64 as r = _deflate_dynamic(bw, src, src_len, litFreq, distFreq);
+    _dyn_collect_tok(tkLen, tkVal, ntok, litFreq, distFreq);
+    let is i64 as r = _deflate_dynamic(bw, tkLen, tkVal, ntok, litFreq, distFreq);
     mem.core.munmap(cast(*u8, litFreq), 286 * 8);
     mem.core.munmap(cast(*u8, distFreq), 30 * 8);
+    mem.core.munmap(cast(*u8, tkLen), (src_len + 2) * 8);
+    mem.core.munmap(cast(*u8, tkVal), (src_len + 2) * 8);
     return r;
 }
 
