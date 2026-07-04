@@ -284,18 +284,31 @@ fn _push_le32(out as *bytes.Bytes, v as i64) as void {
     bytes.bytes_push(out, cast(u8, (v >> 24) & 0xFF));
 }
 
-// Build an LZMA2 stream (compressed chunks, uncompressed fallback) into out.
+// Build an LZMA2 stream into out. Each LZMA2 chunk caps the compressed size at
+// 16 bits (< 64 KiB), so we shrink the uncompressed block until the compressed
+// chunk fits (carrying the working size forward as a hint) instead of ever
+// falling back to storing a large compressible block.
 fn _lzma2_encode(src as *u8, slen as i64, out as *bytes.Bytes) as i64 {
+    let is lzma.Lzma as lz;
+    if (lzma.lzma_init(&lz, 93) < 0) { return errno.Z_OOM; }
     let is i64 as pos with mut = 0;
+    let is i64 as hint with mut = 2097152;                        // 2 MB LZMA2 uncompressed max
     while (pos < slen) {
         let is i64 as block with mut = slen - pos;
-        if (block > 1048576) { block = 1048576; }   // 1 MB (< 2 MB LZMA2 limit)
-        let is bytes.Bytes as comp = bytes.bytes_new(256);
-        let is lzma.Lzma as lz;
-        if (lzma.lzma_init(&lz, 93) < 0) { bytes.bytes_free(&comp); return errno.Z_OOM; }
+        if (block > hint) { block = hint; }
+        let is bytes.Bytes as comp with mut = bytes.bytes_new(256);
         lzma.lzma_reset_probs(&lz);
         lz.dictStart = 0;
         lzma._lzma_encode(&lz, cast(*u8, cast(i64, src) + pos), block, &comp);
+        while (comp.len > 65536 && block > 8192) {               // compressed field is 16-bit
+            bytes.bytes_free(&comp);
+            block = block / 2;
+            comp = bytes.bytes_new(256);
+            lzma.lzma_reset_probs(&lz);
+            lz.dictStart = 0;
+            lzma._lzma_encode(&lz, cast(*u8, cast(i64, src) + pos), block, &comp);
+        }
+        hint = block;
         if (comp.len <= 65536 && comp.len < block) {
             let is i64 as usz = block - 1;
             let is i64 as csz = comp.len - 1;
