@@ -144,6 +144,166 @@ fn rans_encode(syms as *u8, n as i64, out as *bytes.Bytes) as i64 {
     return 0;
 }
 
+// ---- multi-context static rANS (the CSIF §3.6.3 mechanism) ---------------
+// K distributions over the byte alphabet share one rANS stream; the CODEC
+// computes each symbol's context from already-decoded state, so decode is
+// pull-based. Stream = [u8 K][K × freq[256] u16][state 4B LE][rANS bytes].
+
+// Encode n symbols with per-symbol contexts (each < k). Appends the stream.
+fn rans_ctx_encode(syms as *u8, ctxs as *u8, n as i64, k as i64, out as *bytes.Bytes) as i64 {
+    if (k < 1) { return errno.Z_BADHDR; }
+    if (k > 32) { return errno.Z_BADHDR; }
+    // per-context tables
+    let is *i64 as tabs = cast(*i64, mem.core.mmap_anon(k * 512 * 8));   // freq[256]+cum[256] per ctx
+    if (cast(i64, tabs) <= 0) { return errno.Z_OOM; }
+    let is [256]i64 as cnt;
+    let is i64 as c with mut = 0;
+    while (c < k) {
+        let is i64 as s with mut = 0;
+        while (s < RANS_N) { cnt[s] = 0; s = s + 1; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (cast(i64, ctxs[i]) == c) {
+                let is i64 as v = cast(i64, syms[i]);
+                cnt[v] = cnt[v] + 1;
+            }
+            i = i + 1;
+        }
+        _build_freq(cast(*i64, &cnt),
+            cast(*i64, cast(i64, tabs) + (c * 512) * 8),
+            cast(*i64, cast(i64, tabs) + (c * 512 + 256) * 8));
+        c = c + 1;
+    }
+
+    // header
+    bytes.bytes_push(out, cast(u8, k));
+    c = 0;
+    while (c < k) {
+        let is *i64 as fq = cast(*i64, cast(i64, tabs) + (c * 512) * 8);
+        let is i64 as s with mut = 0;
+        while (s < RANS_N) { _w16(out, fq[s]); s = s + 1; }
+        c = c + 1;
+    }
+
+    // backward encode
+    let is i64 as cap = n * 2 + 64;
+    let is *u8 as bk = mem.core.mmap_anon(cap);
+    if (cast(i64, bk) <= 0) { return errno.Z_OOM; }
+    let is i64 as pos with mut = cap;
+    let is i64 as x with mut = RANS_L;
+    let is i64 as i with mut = n - 1;
+    while (i >= 0) {
+        let is i64 as cc = cast(i64, ctxs[i]);
+        let is *i64 as fq = cast(*i64, cast(i64, tabs) + (cc * 512) * 8);
+        let is *i64 as cm = cast(*i64, cast(i64, tabs) + (cc * 512 + 256) * 8);
+        let is i64 as sym = cast(i64, syms[i]);
+        let is i64 as f = fq[sym];
+        let is i64 as x_max = ((RANS_L >> RANS_M) << 8) * f;
+        while (x >= x_max) {
+            pos = pos - 1;
+            bk[pos] = cast(u8, x & 255);
+            x = x >> 8;
+        }
+        let is i64 as q = x / f;
+        x = (q << RANS_M) + (x - q * f) + cm[sym];
+        i = i - 1;
+    }
+    pos = pos - 4;
+    bk[pos]     = cast(u8, x & 255);
+    bk[pos + 1] = cast(u8, (x >> 8) & 255);
+    bk[pos + 2] = cast(u8, (x >> 16) & 255);
+    bk[pos + 3] = cast(u8, (x >> 24) & 255);
+    bytes.bytes_append(out, cast(*u8, cast(i64, bk) + pos), cap - pos);
+    mem.core.munmap(bk, cap);
+    mem.core.munmap(cast(*u8, tabs), k * 512 * 8);
+    return 0;
+}
+
+// Pull-based decoder state.
+struct RansCtx {
+    src as *u8;
+    len as i64;
+    pos as i64;
+    x as i64;
+    k as i64;
+    tabs as i64;      // address: k * (freq[256] + cum[256]) i64
+    slots as i64;     // address: k * 4096 u8 slot->symbol
+}
+
+// Parse the header + init state. Returns 0 or negative.
+fn rans_ctx_init(d as *RansCtx, src as *u8, src_len as i64) as i64 {
+    if (src_len < 1) { return errno.Z_EOF; }
+    let is i64 as k = cast(i64, src[0]);
+    if (k < 1) { return errno.Z_BADHDR; }
+    if (k > 32) { return errno.Z_BADHDR; }
+    let is i64 as hdr = 1 + k * RANS_N * 2;
+    if (hdr + 4 > src_len) { return errno.Z_EOF; }
+
+    let is *i64 as tabs = cast(*i64, mem.core.mmap_anon(k * 512 * 8));
+    let is *u8 as slots = mem.core.mmap_anon(k * RANS_TOTAL);
+    if (cast(i64, slots) <= 0) { return errno.Z_OOM; }
+
+    let is i64 as c with mut = 0;
+    while (c < k) {
+        let is *i64 as fq = cast(*i64, cast(i64, tabs) + (c * 512) * 8);
+        let is *i64 as cm = cast(*i64, cast(i64, tabs) + (c * 512 + 256) * 8);
+        let is i64 as tsum with mut = 0;
+        let is i64 as s with mut = 0;
+        while (s < RANS_N) {
+            let is i64 as off = 1 + (c * RANS_N + s) * 2;
+            fq[s] = cast(i64, src[off]) | (cast(i64, src[off + 1]) << 8);
+            tsum = tsum + fq[s];
+            s = s + 1;
+        }
+        if (tsum != RANS_TOTAL) { return errno.Z_BADSUM; }
+        cm[0] = 0;
+        s = 1;
+        while (s < RANS_N) { cm[s] = cm[s - 1] + fq[s - 1]; s = s + 1; }
+        s = 0;
+        while (s < RANS_N) {
+            let is i64 as a with mut = cm[s];
+            let is i64 as e = cm[s] + fq[s];
+            while (a < e) { slots[c * RANS_TOTAL + a] = cast(u8, s); a = a + 1; }
+            s = s + 1;
+        }
+        c = c + 1;
+    }
+
+    d.src = src;
+    d.len = src_len;
+    d.k = k;
+    d.tabs = cast(i64, tabs);
+    d.slots = cast(i64, slots);
+    d.x = cast(i64, src[hdr]) | (cast(i64, src[hdr + 1]) << 8)
+        | (cast(i64, src[hdr + 2]) << 16) | (cast(i64, src[hdr + 3]) << 24);
+    d.pos = hdr + 4;
+    return 0;
+}
+
+// Decode one symbol under context `ctx` (< k). Returns 0..255, or negative.
+fn rans_ctx_sym(d as *RansCtx, ctx as i64) as i64 {
+    if (ctx < 0) { return errno.Z_BADHDR; }
+    if (ctx >= d.k) { return errno.Z_BADHDR; }
+    let is *i64 as fq = cast(*i64, d.tabs + (ctx * 512) * 8);
+    let is *i64 as cm = cast(*i64, d.tabs + (ctx * 512 + 256) * 8);
+    let is *u8 as sl = cast(*u8, d.slots + ctx * RANS_TOTAL);
+    let is i64 as slot = d.x & (RANS_TOTAL - 1);
+    let is i64 as sym = cast(i64, sl[slot]);
+    d.x = fq[sym] * (d.x >> RANS_M) + slot - cm[sym];
+    while (d.x < RANS_L) {
+        if (d.pos >= d.len) { return errno.Z_EOF; }
+        d.x = (d.x << 8) | cast(i64, d.src[d.pos]);
+        d.pos = d.pos + 1;
+    }
+    return sym;
+}
+
+fn rans_ctx_free(d as *RansCtx) as void {
+    if (d.tabs > 0) { mem.core.munmap(cast(*u8, d.tabs), d.k * 512 * 8); }
+    if (d.slots > 0) { mem.core.munmap(cast(*u8, d.slots), d.k * RANS_TOTAL); }
+    d.tabs = 0; d.slots = 0;
+}
+
 fn rans_decode(src as *u8, src_len as i64, n as i64, out as *u8) as i64 {
     if (src_len < 8) { return errno.Z_EOF; }
     let is i64 as M = cast(i64, src[0]);
