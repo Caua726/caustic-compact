@@ -597,6 +597,245 @@ fn _deflate_dynamic(bw as *bitwriter.BitWriter, tkLen as *i64, tkVal as *i64, nt
     return 0;
 }
 
+// --- optimal parse (level >= 3) ----------------------------------------
+// Greedy and lazy matching both answer "what is the longest match here?" —
+// which is the wrong question. A long match now can strand expensive literals
+// later, and a match one byte shorter that lands on a cheap distance code can
+// come out ahead. The right question is "what is the cheapest encoding of the
+// rest of the block?", which is a shortest path over byte positions.
+//
+// The catch is that the edge costs *are* the Huffman code lengths, and those
+// depend on which edges the path takes. Zopfli's resolution, which this
+// follows: guess a cost model, find the optimal path under it, re-derive the
+// model from the path's own statistics, and repeat. It converges in a handful
+// of rounds and buys several percent over lazy matching — the gap between a
+// stock zlib PNG and a zopflipng one.
+//
+// Costs are carried in 1/256ths of a bit so the whole thing stays integer.
+
+// log2(x) in 1/256ths, for x >= 1: exact on the exponent, linear on the mantissa.
+fn _log2_256(x as i64) as i64 {
+    if (x <= 1) { return 0; }
+    let is i64 as p with mut = 0;
+    while ((1 << (p + 1)) <= x) { p = p + 1; }
+    let is i64 as base = 1 << p;
+    return (p << 8) + ((x - base) << 8) / base;
+}
+
+// Per-symbol cost from a frequency table: the symbol's self-information,
+// log2(total / count). A symbol the previous round never used is priced as if
+// it appeared once-in-total rather than as impossible, so the parse can still
+// reach for it; a symbol that carried everything is floored at one bit,
+// because that is what Huffman will actually charge for it.
+fn _entropy_costs(freq as *i64, nsym as i64, out as *i64) as void {
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nsym) { sum = sum + freq[i]; i = i + 1; }
+    if (sum == 0) {
+        i = 0;
+        while (i < nsym) { out[i] = 8 << 8; i = i + 1; }
+        return;
+    }
+    let is i64 as ls = _log2_256(sum);
+    i = 0;
+    while (i < nsym) {
+        if (freq[i] == 0) { out[i] = ls; }
+        else {
+            let is i64 as c with mut = ls - _log2_256(freq[i]);
+            if (c < 256) { c = 256; }
+            out[i] = c;
+        }
+        i = i + 1;
+    }
+}
+
+// The cost model DEFLATE's fixed Huffman tables impose (RFC 1951 3.2.6),
+// used to seed the first iteration.
+fn _fixed_costs(litc as *i64, distc as *i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 288) {
+        if (i < 144)      { litc[i] = 8 << 8; }
+        else if (i < 256) { litc[i] = 9 << 8; }
+        else if (i < 280) { litc[i] = 7 << 8; }
+        else              { litc[i] = 8 << 8; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 30) { distc[i] = 5 << 8; i = i + 1; }
+}
+
+fn _match_cost(len as i64, dist as i64, litc as *i64, distc as *i64) as i64 {
+    let is i64 as lc = _length_code(len);
+    let is i64 as dc = _dist_code(dist);
+    return litc[257 + lc] + (LEXTRA[lc] << 8) + distc[dc] + (DEXTRA[dc] << 8);
+}
+
+// Shortest path over positions under the given cost model, writing the winning
+// token stream into tkLen/tkVal. Returns the token count.
+fn _optimal_pass(src as *u8, src_len as i64, litc as *i64, distc as *i64,
+                 tkLen as *i64, tkVal as *i64) as i64 {
+    let is i64 as INF with imut = 1 << 60;
+    let is *i64 as head = cast(*i64, mem.core.mmap_anon(_HASH_SIZE * 8));
+    let is *i64 as prev = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
+    let is *i64 as cost = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
+    let is *i64 as plen = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
+    let is *i64 as pdst = cast(*i64, mem.core.mmap_anon((src_len + 1) * 8));
+    let is *i64 as sub  = cast(*i64, mem.core.mmap_anon(259 * 8));
+    mem.core.memset(cast(*u8, head), cast(i32, 0xFF), _HASH_SIZE * 8);
+    let is i64 as i with mut = 0;
+    while (i <= src_len) { cost[i] = INF; plen[i] = 0; pdst[i] = 0; i = i + 1; }
+    cost[0] = 0;
+
+    let is i64 as pos with mut = 0;
+    while (pos < src_len) {
+        let is i64 as cbase = cost[pos];
+        // Longest match at `pos`, plus the nearest distance achieving each
+        // shorter length: the chain runs most-recent-first, so the first
+        // distance to reach a given length is also the smallest one.
+        let is i64 as best with mut = 2;
+        if (pos + 3 <= src_len) {
+            let is i64 as hh = (((cast(i64, src[pos]) << 10) ^ (cast(i64, src[pos + 1]) << 5) ^ cast(i64, src[pos + 2])) & 0x7FFF);
+            let is i64 as cand with mut = head[hh];
+            let is i64 as chain with mut = 0;
+            let is i64 as maxl with mut = src_len - pos;
+            if (maxl > 258) { maxl = 258; }
+            while (cand >= 0 && chain < _MAX_CHAIN && pos - cand <= _WSIZE) {
+                if (src[cand + best] == src[pos + best]) {
+                    let is i64 as l = _match_len(src, cand, pos, maxl);
+                    if (l > best) {
+                        let is i64 as d = pos - cand;
+                        let is i64 as k with mut = best + 1;
+                        while (k <= l) { sub[k] = d; k = k + 1; }
+                        best = l;
+                        if (l >= maxl) { chain = _MAX_CHAIN; }
+                    }
+                }
+                cand = prev[cand];
+                chain = chain + 1;
+            }
+            prev[pos] = head[hh];
+            head[hh] = pos;
+        }
+        if (cbase < INF) {
+            // literal
+            let is i64 as cl = cbase + litc[cast(i64, src[pos])];
+            if (cl < cost[pos + 1]) { cost[pos + 1] = cl; plen[pos + 1] = 0; pdst[pos + 1] = 0; }
+            // every match length reachable from here
+            let is i64 as l2 with mut = 3;
+            while (l2 <= best) {
+                let is i64 as cm = cbase + _match_cost(l2, sub[l2], litc, distc);
+                if (cm < cost[pos + l2]) {
+                    cost[pos + l2] = cm; plen[pos + l2] = l2; pdst[pos + l2] = sub[l2];
+                }
+                l2 = l2 + 1;
+            }
+        }
+        pos = pos + 1;
+    }
+
+    // Walk the path backwards, then reverse it into the token arrays.
+    let is i64 as ntok with mut = 0;
+    let is i64 as p with mut = src_len;
+    while (p > 0) {
+        if (plen[p] == 0) { tkLen[ntok] = 0; tkVal[ntok] = cast(i64, src[p - 1]); p = p - 1; }
+        else { tkLen[ntok] = plen[p]; tkVal[ntok] = pdst[p]; p = p - plen[p]; }
+        ntok = ntok + 1;
+    }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = ntok - 1;
+    while (a < b) {
+        let is i64 as t1 = tkLen[a]; tkLen[a] = tkLen[b]; tkLen[b] = t1;
+        let is i64 as t2 = tkVal[a]; tkVal[a] = tkVal[b]; tkVal[b] = t2;
+        a = a + 1; b = b - 1;
+    }
+
+    mem.core.munmap(cast(*u8, head), _HASH_SIZE * 8);
+    mem.core.munmap(cast(*u8, prev), (src_len + 1) * 8);
+    mem.core.munmap(cast(*u8, cost), (src_len + 1) * 8);
+    mem.core.munmap(cast(*u8, plen), (src_len + 1) * 8);
+    mem.core.munmap(cast(*u8, pdst), (src_len + 1) * 8);
+    mem.core.munmap(cast(*u8, sub), 259 * 8);
+    return ntok;
+}
+
+// What this token stream would cost under the Huffman code its own statistics
+// imply — the yardstick for comparing one iteration's parse against another's.
+fn _stream_cost(tkLen as *i64, tkVal as *i64, ntok as i64) as i64 {
+    let is *i64 as lf = _tab(288);
+    let is *i64 as df = _tab(30);
+    let is *i64 as lc = _tab(288);
+    let is *i64 as dc = _tab(30);
+    _dyn_collect_tok(tkLen, tkVal, ntok, lf, df);
+    _entropy_costs(lf, 288, lc);
+    _entropy_costs(df, 30, dc);
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < ntok) {
+        if (tkLen[i] == 0) { total = total + lc[tkVal[i]]; }
+        else { total = total + _match_cost(tkLen[i], tkVal[i], lc, dc); }
+        i = i + 1;
+    }
+    mem.core.munmap(cast(*u8, lf), 288 * 8);
+    mem.core.munmap(cast(*u8, df), 30 * 8);
+    mem.core.munmap(cast(*u8, lc), 288 * 8);
+    mem.core.munmap(cast(*u8, dc), 30 * 8);
+    return total;
+}
+
+// Iterate the parse/model fixed point and emit the best stream found.
+fn _deflate_optimal_entry(bw as *bitwriter.BitWriter, src as *u8, src_len as i64,
+                          iters as i64) as i64 {
+    let is *i64 as tkLen = _tab(src_len + 2);
+    let is *i64 as tkVal = _tab(src_len + 2);
+    let is *i64 as bkLen = _tab(src_len + 2);
+    let is *i64 as bkVal = _tab(src_len + 2);
+    let is *i64 as litc = _tab(288);
+    let is *i64 as distc = _tab(30);
+    let is *i64 as lf = _tab(288);
+    let is *i64 as df = _tab(30);
+
+    _fixed_costs(litc, distc);
+    let is i64 as bntok with mut = 0;
+    let is i64 as bcost with mut = 0 - 1;
+    let is i64 as it with mut = 0;
+    while (it < iters) {
+        let is i64 as ntok = _optimal_pass(src, src_len, litc, distc, tkLen, tkVal);
+        let is i64 as c = _stream_cost(tkLen, tkVal, ntok);
+        if (bcost < 0 || c < bcost) {
+            bcost = c;
+            bntok = ntok;
+            mem.core.memcpy(cast(*u8, bkLen), cast(*u8, tkLen), ntok * 8);
+            mem.core.memcpy(cast(*u8, bkVal), cast(*u8, tkVal), ntok * 8);
+        }
+        // Re-derive the model from what the parse actually did.
+        let is i64 as z with mut = 0;
+        while (z < 288) { lf[z] = 0; z = z + 1; }
+        z = 0;
+        while (z < 30) { df[z] = 0; z = z + 1; }
+        _dyn_collect_tok(tkLen, tkVal, ntok, lf, df);
+        _entropy_costs(lf, 288, litc);
+        _entropy_costs(df, 30, distc);
+        it = it + 1;
+    }
+
+    let is *i64 as flf = _tab(286);
+    let is *i64 as fdf = _tab(30);
+    _dyn_collect_tok(bkLen, bkVal, bntok, flf, fdf);
+    let is i64 as r = _deflate_dynamic(bw, bkLen, bkVal, bntok, flf, fdf);
+
+    mem.core.munmap(cast(*u8, tkLen), (src_len + 2) * 8);
+    mem.core.munmap(cast(*u8, tkVal), (src_len + 2) * 8);
+    mem.core.munmap(cast(*u8, bkLen), (src_len + 2) * 8);
+    mem.core.munmap(cast(*u8, bkVal), (src_len + 2) * 8);
+    mem.core.munmap(cast(*u8, litc), 288 * 8);
+    mem.core.munmap(cast(*u8, distc), 30 * 8);
+    mem.core.munmap(cast(*u8, lf), 288 * 8);
+    mem.core.munmap(cast(*u8, df), 30 * 8);
+    mem.core.munmap(cast(*u8, flf), 286 * 8);
+    mem.core.munmap(cast(*u8, fdf), 30 * 8);
+    return r;
+}
+
 fn _deflate_dynamic_entry(bw as *bitwriter.BitWriter, src as *u8, src_len as i64) as i64 {
     let is *i64 as tkLen = _tab(src_len + 2);
     let is *i64 as tkVal = _tab(src_len + 2);
@@ -628,7 +867,14 @@ fn deflate_compress(src as *u8, src_len as i64, out as *bytes.Bytes, level as i6
     let is bitwriter.BitWriter as bw;
     bitwriter.bw_init(&bw, &tmp);
     let is i64 as r with mut = 0;
-    if (level >= 2) { r = _deflate_dynamic_entry(&bw, src, src_len); }
+    if (level >= 3) {
+        // level 3 = one optimal parse under fixed-Huffman costs; each level
+        // above that adds a re-derive-the-model-and-re-parse round.
+        let is i64 as iters with mut = level - 2;
+        if (iters > 15) { iters = 15; }
+        r = _deflate_optimal_entry(&bw, src, src_len, iters);
+    }
+    else if (level == 2) { r = _deflate_dynamic_entry(&bw, src, src_len); }
     else { r = _deflate_fixed(&bw, src, src_len); }
     if (r < 0 || bw.err < 0) { bytes.bytes_free(&tmp); return errno.Z_OOM; }
     // stored-block size (5-byte header per <=65535-byte chunk)
