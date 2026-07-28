@@ -17,7 +17,12 @@ target "gzc" {
     out "build/gzc"
 }
 
+# Build before running it. The script used to be the bare invocation, so it
+# worked only where the binary already existed — which is to say on the machine
+# that had just built it, and nowhere else. A fresh clone has no tests/runtests
+# and reported "no such file" rather than a test result.
 script "test" {
+    "caustic-mk build runtests"
     "tests/runtests"
 }
 
