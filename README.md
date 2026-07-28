@@ -82,3 +82,14 @@ tests/     run.cst (the runner) · fixtures/ (committed vectors)
 ```
 
 Conventions, like the sibling [`caustic-net`](https://github.com/Caua726/caustic-net): errors are negative `i64` codes (`core/errno.cst`); the output buffer is `mmap`-backed so it grows past the 64 KB cap of the `bins` slab allocator; `snake_case` functions, `PascalCase` structs, `_prefix` private, `SCREAMING` constants. No generic `Result`/`Option` (the compiler can't construct them).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Every format here is implemented from its published specification (the IETF RFCs
+and public format documents), which carries no licensing obligation. Some parts
+are ported from, or embed data from, permissively licensed reference
+implementations — Brotli's static dictionary and word transforms among them.
+None are copyleft. Their notices are reproduced in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), as those licenses require.
