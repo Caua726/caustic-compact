@@ -12,7 +12,8 @@ use "std/mem.cst" only bins, core as mem;
 struct Bytes {
     ptr as *u8;
     len as i64;
-    cap as i64;   // exact mmap length backing ptr
+    cap as i64;      // exact mmap length backing ptr
+    max_len as i64;  // -1 = unlimited; otherwise bytes_reserve cannot exceed it
 }
 
 // New buffer with capacity `cap` (>=1). len starts at 0.
@@ -23,6 +24,7 @@ fn bytes_new(cap as i64) as Bytes {
     b.ptr = mem.core.mmap_anon(c);
     b.len = 0;
     b.cap = c;
+    b.max_len = 0 - 1;
     return b;
 }
 
@@ -30,6 +32,7 @@ fn bytes_new(cap as i64) as Bytes {
 // Returns 0 ok, <0 on alloc failure. May remap — recompute raw pointers after.
 fn bytes_reserve(b as *Bytes, extra as i64) as i64 {
     let is i64 as need = b.len + extra;
+    if (b.max_len >= 0 && need > b.max_len) { return 0 - 1; }
     if (need <= b.cap) { return 0; }
     let is i64 as ncap with mut = b.cap;
     if (ncap < 1) { ncap = 1; }
@@ -69,4 +72,5 @@ fn bytes_free(b as *Bytes) as void {
     b.ptr = cast(*u8, 0);
     b.len = 0;
     b.cap = 0;
+    b.max_len = 0 - 1;
 }

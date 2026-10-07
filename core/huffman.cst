@@ -10,18 +10,42 @@
 use "errno.cst" as errno;
 use "bitreader.cst" as bitreader;
 use "std/mem.cst" only bins, core as mem;
+let is i64 as ROOT with imut = 9;
 
 let is mem.Bins as _bins with mut;
 let is i32 as _ready with mut = 0;
+let is i32 as _custom with mut = 0;
+let is i64 as _alloc_fn with mut = 0;
+let is i64 as _free_fn with mut = 0;
 
-let is i64 as ROOT with imut = 9;   // root table bit width
+// A freestanding caller supplies allocation that does not depend on an OS
+// syscall. Install before the first Huffman table is built; the default remains
+// the process allocator used by the standalone codecs.
+fn huff_set_allocator(alloc as i64, free as i64) as i32 {
+    if (alloc == 0 || free == 0 || _ready != 0 || _custom != 0) {
+        return cast(i32, 0 - 1);
+    }
+    _alloc_fn = alloc;
+    _free_fn = free;
+    _custom = 1;
+    return cast(i32, 0);
+}
 
 fn _h_alloc(size as i64) as *u8 {
+    if (_custom == 1) {
+        let is fn(i64) as *u8 as fp = cast(fn(i64) as *u8, _alloc_fn);
+        return call(fp, size);
+    }
     if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
     return mem.bins.bins_alloc(&_bins, size);
 }
 
 fn _h_free(ptr as *u8) as void {
+    if (_custom == 1) {
+        let is fn(*u8) as void as fp = cast(fn(*u8) as void, _free_fn);
+        call(fp, ptr);
+        return;
+    }
     if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
 }
 
@@ -34,6 +58,17 @@ struct Huff {
     n       as i64;    // alphabet size
     fast    as *i64;   // 1<<ROOT lookup table
     maxbits as i64;    // longest code length present
+}
+
+fn _h_release(h as *Huff) as void {
+    if (cast(i64, h.count) != 0) { _h_free(cast(*u8, h.count)); }
+    if (cast(i64, h.symbol) != 0) { _h_free(cast(*u8, h.symbol)); }
+    if (cast(i64, h.fast) != 0) { _h_free(cast(*u8, h.fast)); }
+    h.count = cast(*i64, 0);
+    h.symbol = cast(*i64, 0);
+    h.fast = cast(*i64, 0);
+    h.n = 0;
+    h.maxbits = 0;
 }
 
 // Reverse the low `len` bits of `code` (the stream reads codes MSB-first).
@@ -51,7 +86,10 @@ fn huff_build(h as *Huff, lengths as *i64, n as i64) as i64 {
     h.count  = cast(*i64, _h_alloc(16 * 8));
     h.symbol = cast(*i64, _h_alloc(n * 8));
     h.fast   = cast(*i64, _h_alloc((1 << ROOT) * 8));
-    if (cast(i64, h.count) == 0 || cast(i64, h.symbol) == 0 || cast(i64, h.fast) == 0) { return errno.Z_OOM; }
+    if (cast(i64, h.count) == 0 || cast(i64, h.symbol) == 0 || cast(i64, h.fast) == 0) {
+        _h_release(h);
+        return errno.Z_OOM;
+    }
 
     let is i64 as i with mut = 0;
     while (i < 16) { h.count[i] = 0; i = i + 1; }
@@ -64,7 +102,7 @@ fn huff_build(h as *Huff, lengths as *i64, n as i64) as i64 {
     let is i64 as mb with mut = 0;
     while (cl < 16) {
         left = (left << 1) - h.count[cl];
-        if (left < 0) { return errno.Z_BADHUFF; }
+        if (left < 0) { _h_release(h); return errno.Z_BADHUFF; }
         if (h.count[cl] > 0) { mb = cl; }
         cl = cl + 1;
     }
@@ -108,13 +146,7 @@ fn huff_build(h as *Huff, lengths as *i64, n as i64) as i64 {
 }
 
 fn huff_free(h as *Huff) as void {
-    if (cast(i64, h.count) != 0) { _h_free(cast(*u8, h.count)); }
-    if (cast(i64, h.symbol) != 0) { _h_free(cast(*u8, h.symbol)); }
-    if (cast(i64, h.fast) != 0) { _h_free(cast(*u8, h.fast)); }
-    h.count = cast(*i64, 0);
-    h.symbol = cast(*i64, 0);
-    h.fast = cast(*i64, 0);
-    h.n = 0;
+    _h_release(h);
 }
 
 // Bit-at-a-time canonical walk (fallback for codes longer than ROOT).

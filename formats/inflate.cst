@@ -12,14 +12,10 @@ use "../core/bitreader.cst" as bitreader;
 use "../core/huffman.cst" as huffman;
 use "std/mem.cst" only bins, core as mem;
 
-// --- constant tables (no array literals in Caustic; filled once) --------
+// --- tables and allocator ------------------------------------------------
 
 let is mem.Bins as _bins with mut;
 let is i32 as _bins_ready with mut = 0;
-fn _i_alloc(size as i64) as *i64 {
-    if (_bins_ready == 0) { _bins = mem.bins.bins_new(8192); _bins_ready = 1; }
-    return cast(*i64, mem.bins.bins_alloc(&_bins, size));
-}
 
 let is *i64 as LBASE  with mut;    // length base for symbols 257..285
 let is *i64 as LEXTRA with mut;    // length extra bits
@@ -27,6 +23,41 @@ let is *i64 as DBASE  with mut;    // distance base for symbols 0..29
 let is *i64 as DEXTRA with mut;    // distance extra bits
 let is *i64 as CLORDER with mut;   // code-length-code symbol order
 let is i32 as _tables_ready with mut = 0;
+let is i64 as _alloc_fn with mut = 0;
+let is i64 as _free_fn with mut = 0;
+
+// A freestanding caller supplies allocation for decoder tables; the default
+// remains the process allocator used by the standalone codecs.
+fn set_allocator(alloc as i64, free as i64) as i32 {
+    if (alloc == 0 || free == 0 || _bins_ready != 0
+        || _tables_ready != 0 || _alloc_fn != 0) {
+        return cast(i32, 0 - 1);
+    }
+    let is i32 as rc = huffman.huff_set_allocator(alloc, free);
+    if (rc != 0) { return rc; }
+    _alloc_fn = alloc;
+    _free_fn = free;
+    return cast(i32, 0);
+}
+
+fn _i_alloc(size as i64) as *i64 {
+    if (_alloc_fn != 0) {
+        let is fn(i64) as *u8 as fp = cast(fn(i64) as *u8, _alloc_fn);
+        return cast(*i64, call(fp, size));
+    }
+    if (_bins_ready == 0) { _bins = mem.bins.bins_new(8192); _bins_ready = 1; }
+    return cast(*i64, mem.bins.bins_alloc(&_bins, size));
+}
+
+fn _i_free(ptr as *i64) as void {
+    if (cast(i64, ptr) == 0) { return; }
+    if (_free_fn != 0) {
+        let is fn(*u8) as void as fp = cast(fn(*u8) as void, _free_fn);
+        call(fp, cast(*u8, ptr));
+        return;
+    }
+    if (_bins_ready == 1) { mem.bins.bins_free(&_bins, cast(*u8, ptr)); }
+}
 
 fn _tables_init() as i64 {
     if (_tables_ready == 1) { return 0; }
@@ -35,8 +66,21 @@ fn _tables_init() as i64 {
     DBASE   = _i_alloc(30 * 8);
     DEXTRA  = _i_alloc(30 * 8);
     CLORDER = _i_alloc(19 * 8);
-    if (cast(i64, LBASE) == 0) { return errno.Z_OOM; }
-    if (cast(i64, CLORDER) == 0) { return errno.Z_OOM; }
+    if (cast(i64, LBASE) == 0 || cast(i64, LEXTRA) == 0
+        || cast(i64, DBASE) == 0 || cast(i64, DEXTRA) == 0
+        || cast(i64, CLORDER) == 0) {
+        _i_free(LBASE);
+        _i_free(LEXTRA);
+        _i_free(DBASE);
+        _i_free(DEXTRA);
+        _i_free(CLORDER);
+        LBASE = cast(*i64, 0);
+        LEXTRA = cast(*i64, 0);
+        DBASE = cast(*i64, 0);
+        DEXTRA = cast(*i64, 0);
+        CLORDER = cast(*i64, 0);
+        return errno.Z_OOM;
+    }
 
     LBASE[0]=3;   LBASE[1]=4;   LBASE[2]=5;   LBASE[3]=6;   LBASE[4]=7;
     LBASE[5]=8;   LBASE[6]=9;   LBASE[7]=10;  LBASE[8]=11;  LBASE[9]=13;
