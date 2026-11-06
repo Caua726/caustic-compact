@@ -376,6 +376,7 @@ fn suite_brotli() as i64 {
     b = b + check(9, "lorem",  "tests/fixtures/lorem.br",  "tests/fixtures/lorem.bin");
     b = b + check(9, "window", "tests/fixtures/window.br", "tests/fixtures/window.bin");
     b = b + check(9, "big",    "tests/fixtures/big.br",    "tests/fixtures/big.bin");
+    b = b + check(9, "flush",  "tests/fixtures/brotli_flush.br", "tests/fixtures/brotli_flush.bin");
     return b;
 }
 
