@@ -20,6 +20,7 @@
 // byte; what inflate refuses, this refuses with the same code.
 // =======================================================
 
+use "../core/shared.cst" as shared;
 use "../core/errno.cst" as errno;
 use "../core/bytes.cst" as bytes;
 
@@ -177,12 +178,12 @@ let is [29]i64 as _LE;
 let is [30]i64 as _DB;
 let is [30]i64 as _DE;
 let is [19]i64 as _ORD;
-let is i32 as _ready with mut = 0;
+let is u32 as _ready with mut = 0;
 
 // RFC 1951 3.2.5's tables, and 3.2.7's order. Threads that get here first
 // together write the same numbers.
 fn _tables() as void {
-    if (_ready == 1) { return; }
+    if (shared.once_enter(&_ready) == 0) { return; }
     let is i64 as i with mut = 0;
     let is i64 as base with mut = 3;
     while (i < 28) {
@@ -209,7 +210,7 @@ fn _tables() as void {
     _ORD[6] = 9; _ORD[7] = 6; _ORD[8] = 10; _ORD[9] = 5; _ORD[10] = 11; _ORD[11] = 4;
     _ORD[12] = 12; _ORD[13] = 3; _ORD[14] = 13; _ORD[15] = 2; _ORD[16] = 14; _ORD[17] = 1;
     _ORD[18] = 15;
-    _ready = 1;
+    shared.once_leave(&_ready, 1);
 }
 
 fn _fixed(s as *InflateStream) as void {

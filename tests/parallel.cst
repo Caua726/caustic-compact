@@ -1,0 +1,82 @@
+// Every decoder a body over HTTP may need, run by eight threads at once on different data, each
+// answer compared with the file it came from. With state shared between calls this fails or dies.
+use "std/io.cst" as io;
+use "std/mem.cst" only core as mem;
+use "std/thread.cst" as thread;
+use "../core/bytes.cst" as bytes;
+use "../stream.cst" as stream;
+
+let is i64 as N with imut = 8;
+let is i64 as KINDS with imut = 6;
+let is [6]bytes.Bytes as packed with mut;
+let is [6]bytes.Bytes as plain with mut;
+let is [6]i64 as fmt with mut;
+let is i64 as rounds with mut = 40;
+let is i32 as go with mut = 0;
+
+fn load(path as *u8, out as *bytes.Bytes) as void {
+    *out = bytes.bytes_new(65536);
+    let is i64 as fd = syscall(2, path, 0, 0);
+    if (fd < 0) { io.write_str(io.STDOUT, "missing fixture\n"); syscall(60, 2); }
+    stream.stream_read_fd(fd, out);
+    syscall(3, fd);
+}
+fn now_us() as i64 { let is [2]i64 as t with mut; syscall(228, 1, &t); return t[0] * 1000000 + t[1] / 1000; }
+fn worker(id as i64) as i64 {
+    let is i64 as bad with mut = 0;
+    let is i64 as r with mut = 0;
+    while (atomic_load(&go) == 0) { }
+    while (r < rounds) {
+        let is i64 as k = (id + r) % KINDS;
+        let is bytes.Bytes as o with mut = bytes.bytes_new(4096);
+        let is i64 as n = stream.stream_decompress(fmt[k], packed[k].ptr, packed[k].len, &o);
+        if (n != plain[k].len || o.len != plain[k].len) { bad = bad + 1; }
+        else {
+            let is i64 as i with mut = 0;
+            while (i < o.len && o.ptr[i] == plain[k].ptr[i]) { i = i + 1; }
+            if (i < o.len) { bad = bad + 1; }
+        }
+        bytes.bytes_free(&o);
+        r = r + 1;
+    }
+    return bad;
+}
+fn mapped_kb() as i64 {
+    let is [256]u8 as b;
+    let is i64 as fd = syscall(2, "/proc/self/statm", 0, 0);
+    let is i64 as n = syscall(0, fd, &b, 255);
+    syscall(3, fd);
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n && b[i] >= 48 && b[i] <= 57) { v = v * 10 + cast(i64, b[i]) - 48; i = i + 1; }
+    return v * 4;
+}
+fn say(what as *u8, v as i64) as void { io.write_str(io.STDOUT, what); io.write_int(io.STDOUT, v); io.write_str(io.STDOUT, "\n"); }
+fn main(argc as i32, argv as **u8) as i32 {
+    if (argc > 1) { rounds = 400; }
+    load("tests/fixtures/big.gz", &packed[0]); load("tests/fixtures/big.bin", &plain[0]); fmt[0] = stream.FMT_GZIP;
+    load("tests/fixtures/big.zlib", &packed[1]); load("tests/fixtures/big.bin", &plain[1]); fmt[1] = stream.FMT_ZLIB;
+    load("tests/fixtures/big.br", &packed[2]); load("tests/fixtures/big.bin", &plain[2]); fmt[2] = stream.FMT_BROTLI;
+    load("tests/fixtures/window.br", &packed[3]); load("tests/fixtures/window.bin", &plain[3]); fmt[3] = stream.FMT_BROTLI;
+    load("tests/fixtures/big.zst", &packed[4]); load("tests/fixtures/big.bin", &plain[4]); fmt[4] = stream.FMT_ZSTD;
+    load("tests/fixtures/window.zst", &packed[5]); load("tests/fixtures/window.bin", &plain[5]); fmt[5] = stream.FMT_ZSTD;
+    // The very first decode of each format is in the threads too, for the tables made once.
+    let is [8]thread.Thread as t;
+    let is i64 as i with mut = 0;
+    while (i < N) { if (thread.spawn(&t[i], fn_ptr(worker), i) != 0) { return 3; } i = i + 1; }
+    let is i64 as t0 with mut = now_us();
+    atomic_store(&go, 1);
+    let is i64 as bad with mut = 0;
+    i = 0;
+    while (i < N) { bad = bad + thread.join(&t[i]); i = i + 1; }
+    say("parallel us ", now_us() - t0);
+    let is i64 as m0 = mapped_kb();
+    t0 = now_us();
+    i = 0;
+    while (i < N) { bad = bad + worker(i); i = i + 1; }
+    say("one by one us ", now_us() - t0);
+    say("mapped more KB ", mapped_kb() - m0);
+    if (mapped_kb() - m0 > 1024) { io.write_str(io.STDOUT, "memory kept after decoding\n"); bad = bad + 1; }
+    say("wrong ", bad);
+    return cast(i32, bad != 0);
+}

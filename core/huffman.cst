@@ -31,6 +31,13 @@ fn huff_set_allocator(alloc as i64, free as i64) as i32 {
     return cast(i32, 0);
 }
 
+// The allocator is there from now on: before the first tables, where threads may build them.
+fn huff_ready() as void {
+    if (_custom == 1 || _ready == 1) { return; }
+    _bins = mem.bins.bins_new(65536);
+    _ready = 1;
+}
+
 fn _h_alloc(size as i64) as *u8 {
     if (_custom == 1) {
         let is fn(i64) as *u8 as fp = cast(fn(i64) as *u8, _alloc_fn);

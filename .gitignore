@@ -4,3 +4,4 @@ build/
 *.cst.s.o
 tests/runtests
 bench_bin
+tests/runparallel

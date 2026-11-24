@@ -7,6 +7,11 @@ target "runtests" {
     out "tests/runtests"
 }
 
+target "runparallel" {
+    src "tests/parallel.cst"
+    out "tests/runparallel"
+}
+
 target "zcat" {
     src "examples/zcat.cst"
     out "build/zcat"
@@ -24,6 +29,8 @@ target "gzc" {
 script "test" {
     "caustic-mk build runtests"
     "tests/runtests"
+    "caustic-mk build runparallel"
+    "tests/runparallel"
 }
 
 script "clean" {
