@@ -13,6 +13,7 @@ use "../core/huffman.cst" as huffman;
 use "../core/checksum.cst" as checksum;
 use "../core/bytes.cst" as bytes;
 use "../formats/inflate.cst" as inflate;
+use "../formats/inflate_stream.cst" as istream;
 use "../formats/deflate.cst" as deflate;
 use "../formats/gzip.cst" as gzip;
 use "../formats/zlib.cst" as zlib;
@@ -509,11 +510,131 @@ fn suite_truncated() as i64 {
     return b;
 }
 
+
+// --- inflate_stream: the same stream as it arrives -------------------
+// Fed in any pieces, the output is inflate()'s for the whole, every run in
+// between a prefix of it; a stream that stops short never ends; garbage
+// gets the verdict inflate() gives (running out of input is "more").
+fn _grow(comp as *u8, clen as i64, exp as *u8, elen as i64, step as i64) as i64 {
+    let is istream.InflateStream as s = istream.inflate_stream(elen + 1);
+    let is i64 as k with mut = 0;
+    let is i64 as was with mut = 0;
+    let is i64 as r with mut = 0;
+    while (k < clen) {
+        let is i64 as add with mut = step;
+        if (step == 0) { add = 1 + (_trnd() * 37) % 3000; }
+        k = k + add;
+        if (k > clen) { k = clen; }
+        r = istream.inflate_stream_run(&s, comp, k);
+        if (r < 0) { return 1; }
+        if (r == 1 && k < clen && s.end_bit > k * 8) { return 2; }
+        if (s.out.len < was || _prefix(&s.out, exp, elen) == 0) { return 3; }
+        was = s.out.len;
+    }
+    if (r != 1 || _same(&s.out, exp, elen) == 0) { return 4; }
+    if (istream.inflate_stream_run(&s, comp, clen) != 1) { return 5; }
+    istream.inflate_stream_free(&s);
+    return 0;
+}
+
+fn _stream_fixture(name as *u8, raw_path as *u8, bin_path as *u8) as i64 {
+    io.write_str(io.STDOUT, "  stream ");
+    io.write_str(io.STDOUT, name);
+    let is i64 as clen with mut = 0;
+    let is *u8 as comp = read_whole(raw_path, &clen);
+    let is i64 as elen with mut = 0;
+    let is *u8 as exp = read_whole(bin_path, &elen);
+    if (cast(i64, comp) == 0 || cast(i64, exp) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is i64 as b with mut = 0;
+    if (_grow(comp, clen, exp, elen, clen) != 0) { b = b + 1; }
+    if (_grow(comp, clen, exp, elen, 0) != 0) { b = b + 1; }
+    if (clen <= 4000 && _grow(comp, clen, exp, elen, 1) != 0) { b = b + 1; }
+    if (clen > 4000 && _grow(comp, clen, exp, elen, 997) != 0) { b = b + 1; }
+    // Cut: never done, never past the whole, a prefix.
+    let is i64 as k with mut = 0;
+    let is i64 as st with mut = clen / 40;
+    if (st < 1) { st = 1; }
+    while (k < clen - 1) {
+        let is istream.InflateStream as s = istream.inflate_stream(elen + 1);
+        let is i64 as r = istream.inflate_stream_run(&s, comp, k);
+        if (r < 0 || (r == 1 && _same(&s.out, exp, elen) == 0) || _prefix(&s.out, exp, elen) == 0) { b = b + 1; }
+        istream.inflate_stream_free(&s);
+        k = k + st;
+    }
+    // Less room than the output: refused.
+    if (elen > 1) {
+        let is istream.InflateStream as small = istream.inflate_stream(elen / 2);
+        if (istream.inflate_stream_run(&small, comp, clen) >= 0 || small.out.len > elen / 2) { b = b + 1; }
+        istream.inflate_stream_free(&small);
+    }
+    if (b == 0) { io.write_str(io.STDOUT, " ... PASS\n"); } else { io.write_str(io.STDOUT, " ... FAIL\n"); }
+    return b;
+}
+
+fn suite_stream() as i64 {
+    io.write_str(io.STDOUT, "[inflate_stream]\n");
+    let is i64 as b with mut = 0;
+    b = b + _stream_fixture("empty",    "tests/fixtures/empty.raw",    "tests/fixtures/empty.bin");
+    b = b + _stream_fixture("hello",    "tests/fixtures/hello.raw",    "tests/fixtures/hello.bin");
+    b = b + _stream_fixture("run",      "tests/fixtures/run.raw",      "tests/fixtures/run.bin");
+    b = b + _stream_fixture("lorem",    "tests/fixtures/lorem.raw",    "tests/fixtures/lorem.bin");
+    b = b + _stream_fixture("binall",   "tests/fixtures/binall.raw",   "tests/fixtures/binall.bin");
+    b = b + _stream_fixture("fixedlit", "tests/fixtures/fixedlit.raw", "tests/fixtures/fixedlit.bin");
+    b = b + _stream_fixture("big",      "tests/fixtures/big.raw",      "tests/fixtures/big.bin");
+    b = b + _stream_fixture("window",   "tests/fixtures/window.raw",   "tests/fixtures/window.bin");
+    // Every level of this encoder, stored blocks included.
+    io.write_str(io.STDOUT, "  stream levels");
+    let is i64 as wl with mut = 0;
+    let is *u8 as win = read_whole("tests/fixtures/window.bin", &wl);
+    let is i64 as lb with mut = 0;
+    let is i64 as lv with mut = 0;
+    while (lv <= 9) {
+        let is bytes.Bytes as z = bytes.bytes_new(1024);
+        zlib.zlib_compress(win, 60000, &z, lv);
+        if (_grow(cast(*u8, cast(i64, z.ptr) + 2), z.len - 6, win, 60000, 0) != 0) { lb = lb + 1; }
+        bytes.bytes_free(&z);
+        lv = lv + 1;
+    }
+    if (lb == 0) { io.write_str(io.STDOUT, " ... PASS\n"); } else { io.write_str(io.STDOUT, " ... FAIL\n"); }
+    b = b + lb;
+    // Garbage: inflate()'s verdict.
+    io.write_str(io.STDOUT, "  stream garbage");
+    let is [1024]u8 as junk;
+    let is i64 as gb with mut = 0;
+    let is i64 as t with mut = 0;
+    while (t < 600) {
+        let is i64 as n = 4 + (t * 53) % 1020;
+        let is i64 as i with mut = 0;
+        while (i < n) { junk[i] = cast(u8, _trnd()); i = i + 1; }
+        junk[0] = cast(u8, (cast(i64, junk[0]) & 248) | (t % 8));
+        let is bytes.Bytes as o = bytes.bytes_new(256);
+        let is i64 as ri = inflate.inflate(cast(*u8, &junk), n, &o);
+        let is istream.InflateStream as s = istream.inflate_stream(1 << 30);
+        let is i64 as rs = istream.inflate_stream_run(&s, cast(*u8, &junk), n);
+        if (ri >= 0) {
+            if (rs != 1 || _same(&s.out, o.ptr, o.len) == 0) { gb = gb + 1; }
+        } else if (ri == errno_eof()) {
+            if (rs != 0) { gb = gb + 1; }
+        } else {
+            if (rs != ri) { gb = gb + 1; }
+        }
+        bytes.bytes_free(&o);
+        istream.inflate_stream_free(&s);
+        t = t + 1;
+    }
+    if (gb == 0) { io.write_str(io.STDOUT, " ... PASS\n"); } else { io.write_str(io.STDOUT, " ... FAIL\n"); }
+    b = b + gb;
+    return b;
+}
+
+fn errno_eof() as i64 { return 0 - 1; }
+
 fn main() as i32 {
     let is i64 as bad with mut = 0;
     bad = bad + suite_core();
     bad = bad + suite_inflate();
     bad = bad + suite_truncated();
+    bad = bad + suite_stream();
     bad = bad + suite_gzip();
     bad = bad + suite_deflate();
     bad = bad + suite_lz4();

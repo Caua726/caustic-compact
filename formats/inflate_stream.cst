@@ -1,0 +1,421 @@
+// =======================================================
+// caustic-compact/formats/inflate_stream.cst
+// DEFLATE (RFC 1951) decoded while the stream is still arriving.
+//
+//   let is InflateStream as s = inflate_stream(most);
+//   inflate_stream_run(&s, src, len)   each time the stream has grown
+//   s.out                              every byte decoded so far
+//   inflate_stream_free(&s)
+//
+// src is the whole stream so far — the caller keeps it, and may move it as
+// it grows: the state holds offsets, not pointers. A run goes on from the
+// symbol where the last one ran out of input, with the block's Huffman
+// tables kept, so no part of the stream is decoded twice; in all, the runs
+// cost what one inflate of the whole stream costs. Running out of input is
+// not an error: run returns 0 and waits for more. 1 when the final block is
+// done (s.end_bit is where it ended), <0 for a bad stream. A code is decoded
+// only from bits that came, and output past `most` bytes is refused.
+//
+// The output is the same as inflate() gives for the same stream, byte for
+// byte; what inflate refuses, this refuses with the same code.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/bytes.cst" as bytes;
+
+let is i64 as _MORE with imut = 0 - 1000;   // ran out of input (internal)
+
+let is i64 as AT_HEADER with imut = 0;
+let is i64 as IN_STORED with imut = 1;
+let is i64 as IN_CODES  with imut = 2;
+let is i64 as AT_END    with imut = 3;
+
+struct StreamHuff {
+    count  as [16]i64;
+    symbol as [288]i64;
+    fast   as [512]i64;   // next 9 bits -> symbol | length << 16; 0: longer
+}
+
+struct InflateStream {
+    out      as bytes.Bytes;
+    most     as i64;
+    where    as i64;      // AT_HEADER, IN_STORED, IN_CODES, AT_END
+    bit      as i64;      // where the next run starts, in bits from src
+    last     as i64;      // the block being decoded is the final one
+    left     as i64;      // a stored block's bytes still to copy
+    end_bit  as i64;      // AT_END: the bit after the final block
+    lit      as StreamHuff;
+    dist     as StreamHuff;
+}
+
+struct _Rd {
+    src   as *u8;
+    len   as i64;
+    pos   as i64;   // bytes taken into acc
+    acc   as i64;
+    nbits as i64;
+}
+
+fn inflate_stream(most as i64) as InflateStream {
+    let is InflateStream as s;
+    s.out = bytes.bytes_new(4096);
+    s.most = most;
+    s.where = AT_HEADER;
+    s.bit = 0;
+    s.last = 0;
+    s.left = 0;
+    s.end_bit = 0;
+    return s;
+}
+
+fn inflate_stream_free(s as *InflateStream) as void { bytes.bytes_free(&s.out); }
+
+fn _at(r as *_Rd) as i64 { return r.pos * 8 - r.nbits; }
+
+fn _fill(r as *_Rd) as void {
+    while (r.nbits <= 48 && r.pos < r.len) {
+        r.acc = r.acc | (cast(i64, r.src[r.pos]) << r.nbits);
+        r.pos = r.pos + 1;
+        r.nbits = r.nbits + 8;
+    }
+}
+
+fn _get(r as *_Rd, n as i64) as i64 {
+    if (n == 0) { return 0; }
+    if (r.nbits < n) { _fill(r); }
+    if (r.nbits < n) { return _MORE; }
+    let is i64 as v = r.acc & ((1 << n) - 1);
+    r.acc = r.acc >> n;
+    r.nbits = r.nbits - n;
+    return v;
+}
+
+// Canonical code from n lengths: Z_BADHUFF if they over-subscribe, as
+// huffman.huff_build says.
+fn _build(h as *StreamHuff, lens as *i64, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 16) { h.count[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < n) { h.count[lens[i]] = h.count[lens[i]] + 1; i = i + 1; }
+    h.count[0] = 0;
+    let is i64 as left with mut = 1;
+    i = 1;
+    while (i < 16) {
+        left = (left << 1) - h.count[i];
+        if (left < 0) { return errno.Z_BADHUFF; }
+        i = i + 1;
+    }
+    let is [16]i64 as offs;
+    offs[1] = 0;
+    i = 1;
+    while (i < 15) { offs[i + 1] = offs[i] + h.count[i]; i = i + 1; }
+    i = 0;
+    while (i < n) {
+        let is i64 as l = lens[i];
+        if (l != 0) { h.symbol[offs[l]] = i; offs[l] = offs[l] + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 512) { h.fast[i] = 0; i = i + 1; }
+    let is i64 as code with mut = 0;
+    let is i64 as idx with mut = 0;
+    let is i64 as l with mut = 1;
+    while (l < 16) {
+        let is i64 as c with mut = 0;
+        while (c < h.count[l]) {
+            if (l <= 9) {
+                let is i64 as rev with mut = 0;
+                let is i64 as k with mut = 0;
+                while (k < l) { rev = (rev << 1) | ((code >> k) & 1); k = k + 1; }
+                let is i64 as f with mut = rev;
+                while (f < 512) { h.fast[f] = (l << 16) | h.symbol[idx]; f = f + (1 << l); }
+            }
+            code = code + 1;
+            idx = idx + 1;
+            c = c + 1;
+        }
+        code = code << 1;
+        l = l + 1;
+    }
+    return 0;
+}
+
+// One symbol from bits that came: _MORE short of them, Z_BADHUFF for a
+// code that is not in the table.
+fn _sym(r as *_Rd, h as *StreamHuff) as i64 {
+    if (r.nbits < 15) { _fill(r); }
+    let is i64 as e = h.fast[r.acc & 511];
+    let is i64 as fl = e >> 16;
+    if (fl > 0 && fl <= r.nbits) {
+        r.acc = r.acc >> fl;
+        r.nbits = r.nbits - fl;
+        return e & 65535;
+    }
+    let is i64 as code with mut = 0;
+    let is i64 as first with mut = 0;
+    let is i64 as index with mut = 0;
+    let is i64 as len with mut = 1;
+    while (len < 16) {
+        if (len > r.nbits) { return _MORE; }
+        code = code | ((r.acc >> (len - 1)) & 1);
+        let is i64 as cnt = h.count[len];
+        if (code - first < cnt) {
+            r.acc = r.acc >> len;
+            r.nbits = r.nbits - len;
+            return h.symbol[index + (code - first)];
+        }
+        index = index + cnt;
+        first = (first + cnt) << 1;
+        code = code << 1;
+        len = len + 1;
+    }
+    return errno.Z_BADHUFF;
+}
+
+let is [29]i64 as _LB;
+let is [29]i64 as _LE;
+let is [30]i64 as _DB;
+let is [30]i64 as _DE;
+let is [19]i64 as _ORD;
+let is i32 as _ready with mut = 0;
+
+// RFC 1951 3.2.5's tables, and 3.2.7's order. Threads that get here first
+// together write the same numbers.
+fn _tables() as void {
+    if (_ready == 1) { return; }
+    let is i64 as i with mut = 0;
+    let is i64 as base with mut = 3;
+    while (i < 28) {
+        let is i64 as e with mut = 0;
+        if (i >= 8) { e = (i - 4) / 4; }
+        _LE[i] = e;
+        _LB[i] = base;
+        base = base + (1 << e);
+        i = i + 1;
+    }
+    _LB[28] = 258;
+    _LE[28] = 0;
+    i = 0;
+    base = 1;
+    while (i < 30) {
+        let is i64 as e with mut = 0;
+        if (i >= 4) { e = (i - 2) / 2; }
+        _DE[i] = e;
+        _DB[i] = base;
+        base = base + (1 << e);
+        i = i + 1;
+    }
+    _ORD[0] = 16; _ORD[1] = 17; _ORD[2] = 18; _ORD[3] = 0; _ORD[4] = 8; _ORD[5] = 7;
+    _ORD[6] = 9; _ORD[7] = 6; _ORD[8] = 10; _ORD[9] = 5; _ORD[10] = 11; _ORD[11] = 4;
+    _ORD[12] = 12; _ORD[13] = 3; _ORD[14] = 13; _ORD[15] = 2; _ORD[16] = 14; _ORD[17] = 1;
+    _ORD[18] = 15;
+    _ready = 1;
+}
+
+fn _fixed(s as *InflateStream) as void {
+    let is [288]i64 as l;
+    let is i64 as i with mut = 0;
+    while (i < 288) {
+        let is i64 as v with mut = 8;
+        if (i >= 144 && i < 256) { v = 9; }
+        if (i >= 256 && i < 280) { v = 7; }
+        l[i] = v;
+        i = i + 1;
+    }
+    _build(&s.lit, cast(*i64, &l), 288);
+    i = 0;
+    while (i < 30) { l[i] = 5; i = i + 1; }
+    _build(&s.dist, cast(*i64, &l), 30);
+}
+
+// A dynamic block's code lengths into s.lit and s.dist.
+fn _dynamic(s as *InflateStream, r as *_Rd) as i64 {
+    let is i64 as hlit = _get(r, 5);
+    if (hlit < 0) { return hlit; }
+    let is i64 as hdist = _get(r, 5);
+    if (hdist < 0) { return hdist; }
+    let is i64 as hclen = _get(r, 4);
+    if (hclen < 0) { return hclen; }
+    let is i64 as nl = hlit + 257;
+    let is i64 as nd = hdist + 1;
+    let is [320]i64 as lens;
+    let is i64 as i with mut = 0;
+    while (i < 320) { lens[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < hclen + 4) {
+        let is i64 as v = _get(r, 3);
+        if (v < 0) { return v; }
+        lens[_ORD[i]] = v;
+        i = i + 1;
+    }
+    let is StreamHuff as cl;
+    let is i64 as rb = _build(&cl, cast(*i64, &lens), 19);
+    if (rb < 0) { return rb; }
+    i = 0;
+    while (i < 19) { lens[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < nl + nd) {
+        let is i64 as sym = _sym(r, &cl);
+        if (sym < 0) { return sym; }
+        if (sym < 16) {
+            lens[i] = sym;
+            i = i + 1;
+        } else {
+            let is i64 as prev with mut = 0;
+            let is i64 as rep with mut = 0;
+            if (sym == 16) {
+                if (i == 0) { return errno.Z_BADHUFF; }
+                prev = lens[i - 1];
+                rep = _get(r, 2);
+                if (rep < 0) { return rep; }
+                rep = rep + 3;
+            } else if (sym == 17) {
+                rep = _get(r, 3);
+                if (rep < 0) { return rep; }
+                rep = rep + 3;
+            } else {
+                rep = _get(r, 7);
+                if (rep < 0) { return rep; }
+                rep = rep + 11;
+            }
+            if (i + rep > nl + nd) { return errno.Z_BADHUFF; }
+            while (rep > 0) { lens[i] = prev; i = i + 1; rep = rep - 1; }
+        }
+    }
+    let is i64 as r1 = _build(&s.lit, cast(*i64, &lens), nl);
+    if (r1 < 0) { return r1; }
+    let is i64 as r2 = _build(&s.dist, cast(*i64, cast(i64, &lens) + nl * 8), nd);
+    if (r2 < 0) { return r2; }
+    return 0;
+}
+
+fn _push(s as *InflateStream, v as i64) as i64 {
+    if (s.out.len >= s.most) { return errno.Z_OOM; }
+    if (bytes.bytes_push(&s.out, cast(u8, v)) < 0) { return errno.Z_OOM; }
+    return 0;
+}
+
+// A Huffman block's symbols to its end (0), or to where the input ends
+// (_MORE, s.bit at the symbol it could not finish).
+fn _codes(s as *InflateStream, r as *_Rd) as i64 {
+    while (1 == 1) {
+        // Room for the longest symbol's bytes, and an 8-byte copy's overrun.
+        if (s.out.len + 266 > s.out.cap) {
+            if (bytes.bytes_reserve(&s.out, 266) < 0) { return errno.Z_OOM; }
+        }
+        let is i64 as at = _at(r);
+        let is i64 as sym = _sym(r, &s.lit);
+        if (sym == _MORE) { s.bit = at; return _MORE; }
+        if (sym < 0) { return sym; }
+        if (sym < 256) {
+            if (s.out.len >= s.most) { return errno.Z_OOM; }
+            s.out.ptr[s.out.len] = cast(u8, sym);
+            s.out.len = s.out.len + 1;
+        } else if (sym == 256) {
+            return 0;
+        } else {
+            let is i64 as li = sym - 257;
+            if (li >= 29) { return errno.Z_BADHUFF; }
+            let is i64 as le = _get(r, _LE[li]);
+            if (le == _MORE) { s.bit = at; return _MORE; }
+            let is i64 as length = _LB[li] + le;
+            let is i64 as ds = _sym(r, &s.dist);
+            if (ds == _MORE) { s.bit = at; return _MORE; }
+            if (ds < 0) { return ds; }
+            if (ds >= 30) { return errno.Z_BADDIST; }
+            let is i64 as de = _get(r, _DE[ds]);
+            if (de == _MORE) { s.bit = at; return _MORE; }
+            let is i64 as d = _DB[ds] + de;
+            if (d > s.out.len) { return errno.Z_BADDIST; }
+            if (s.out.len + length > s.most) { return errno.Z_OOM; }
+            let is i64 as p = cast(i64, s.out.ptr);
+            let is i64 as dst with mut = s.out.len;
+            let is i64 as end = dst + length;
+            if (d >= 8) {
+                // 8 at a time: the source is always 8 or more behind; the
+                // last step may write up to 7 bytes past end, within room.
+                while (dst < end) {
+                    cast(*i64, p + dst)[0] = cast(*i64, p + dst - d)[0];
+                    dst = dst + 8;
+                }
+            } else {
+                let is *u8 as o = s.out.ptr;
+                while (dst < end) { o[dst] = o[dst - d]; dst = dst + 1; }
+            }
+            s.out.len = end;
+        }
+    }
+    return 0;
+}
+
+// The stream so far, src[0..len): 1 when its final block is done, 0 for
+// more, <0 when it is bad (and every run after says the same).
+fn inflate_stream_run(s as *InflateStream, src as *u8, len as i64) as i64 {
+    if (s.where == AT_END) { return 1; }
+    if (s.where < 0) { return s.where; }
+    _tables();
+    let is _Rd as r;
+    r.src = src;
+    r.len = len;
+    r.pos = s.bit / 8;
+    r.acc = 0;
+    r.nbits = 0;
+    if ((s.bit & 7) != 0) {
+        if (_get(&r, s.bit & 7) < 0) { return 0; }
+    }
+    while (1 == 1) {
+        if (s.where == AT_HEADER) {
+            let is i64 as at = _at(&r);
+            let is i64 as last = _get(&r, 1);
+            let is i64 as kind = _get(&r, 2);
+            let is i64 as rc with mut = _MORE;
+            if (last >= 0 && kind >= 0) {
+                if (kind == 0) {
+                    let is i64 as drop = r.nbits & 7;   // to a whole byte
+                    r.acc = r.acc >> drop;
+                    r.nbits = r.nbits - drop;
+                    let is i64 as ln = _get(&r, 16);
+                    let is i64 as nln = _get(&r, 16);
+                    if (ln >= 0 && nln >= 0) {
+                        if ((ln ^ 65535) != nln) { rc = errno.Z_BADLEN; }
+                        else { s.left = ln; s.where = IN_STORED; rc = 0; }
+                    }
+                } else if (kind == 1) {
+                    _fixed(s);
+                    s.where = IN_CODES;
+                    rc = 0;
+                } else if (kind == 2) {
+                    rc = _dynamic(s, &r);
+                    if (rc == 0) { s.where = IN_CODES; }
+                } else {
+                    rc = errno.Z_BADTYPE;
+                }
+            }
+            if (rc == _MORE) { s.bit = at; return 0; }
+            if (rc < 0) { s.where = rc; return rc; }
+            s.last = last;
+        } else if (s.where == IN_STORED) {
+            while (s.left > 0) {
+                let is i64 as v = _get(&r, 8);
+                if (v < 0) { s.bit = _at(&r); return 0; }
+                let is i64 as pr = _push(s, v);
+                if (pr < 0) { s.where = pr; return pr; }
+                s.left = s.left - 1;
+            }
+            s.where = AT_HEADER;
+            if (s.last == 1) { s.where = AT_END; }
+        } else {
+            let is i64 as rc = _codes(s, &r);
+            if (rc == _MORE) { return 0; }
+            if (rc < 0) { s.where = rc; return rc; }
+            s.where = AT_HEADER;
+            if (s.last == 1) { s.where = AT_END; }
+        }
+        if (s.where == AT_END) {
+            s.end_bit = _at(&r);
+            s.bit = s.end_bit;
+            return 1;
+        }
+    }
+    return 0;
+}
