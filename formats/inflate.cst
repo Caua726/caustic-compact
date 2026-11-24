@@ -161,6 +161,10 @@ fn _inflate_stored(br as *bitreader.BitReader, out as *bytes.Bytes) as i64 {
 }
 
 // --- shared symbol loop for fixed/dynamic Huffman blocks ----------------
+// A table entry is taken only when the bits it spans are in the reader: at
+// the input's end the reader's top bits are zeros that never came, and a
+// code read from them would decode on forever. Short of bits, huff_decode
+// reads a bit at a time and says Z_EOF.
 fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
                           lit as *huffman.Huff, dist as *huffman.Huff) as i64 {
     let is i64 as sym with mut = 0;
@@ -168,7 +172,7 @@ fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
         while (br.nbits < 9) { if (br.pos >= br.len) { break; } br.acc = br.acc | (cast(i64, br.src[br.pos]) << br.nbits); br.pos = br.pos + 1; br.nbits = br.nbits + 8; }
         let is i64 as _e = lit.fast[br.acc & 511];
         let is i64 as _l = _e >> 16;
-        if (_l > 0) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; sym = _e & 0xFFFF; }
+        if (_l > 0 && _l <= br.nbits) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; sym = _e & 0xFFFF; }
         else { sym = huffman.huff_decode(lit, br); }
     }
     while (sym != 256) {
@@ -186,7 +190,7 @@ fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
         while (br.nbits < 9) { if (br.pos >= br.len) { break; } br.acc = br.acc | (cast(i64, br.src[br.pos]) << br.nbits); br.pos = br.pos + 1; br.nbits = br.nbits + 8; }
         let is i64 as _e = dist.fast[br.acc & 511];
         let is i64 as _l = _e >> 16;
-        if (_l > 0) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; dsym = _e & 0xFFFF; }
+        if (_l > 0 && _l <= br.nbits) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; dsym = _e & 0xFFFF; }
         else { dsym = huffman.huff_decode(dist, br); }
     }
             if (dsym < 0) { return dsym; }
@@ -201,7 +205,7 @@ fn _inflate_huffman_block(br as *bitreader.BitReader, out as *bytes.Bytes,
         while (br.nbits < 9) { if (br.pos >= br.len) { break; } br.acc = br.acc | (cast(i64, br.src[br.pos]) << br.nbits); br.pos = br.pos + 1; br.nbits = br.nbits + 8; }
         let is i64 as _e = lit.fast[br.acc & 511];
         let is i64 as _l = _e >> 16;
-        if (_l > 0) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; sym = _e & 0xFFFF; }
+        if (_l > 0 && _l <= br.nbits) { br.acc = br.acc >> _l; br.nbits = br.nbits - _l; sym = _e & 0xFFFF; }
         else { sym = huffman.huff_decode(lit, br); }
     }
     }

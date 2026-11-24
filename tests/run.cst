@@ -380,10 +380,140 @@ fn suite_brotli() as i64 {
     return b;
 }
 
+
+// --- truncated and malformed DEFLATE ---------------------------------
+// A stream cut anywhere must end in an error (or, at its very end, the whole
+// output): never more output than the whole, never anything but a prefix of
+// it, and never a decode that goes on past the input. Before the fix a cut
+// inside a Huffman block decoded the zero bits past the end without stopping.
+let is i64 as _tseed with mut = 99;
+fn _trnd() as i64 {
+    _tseed = _tseed * 6364136223846793005 + 1442695040888963407;
+    return (_tseed >> 33) & 255;
+}
+
+fn _prefix(out as *bytes.Bytes, exp as *u8, elen as i64) as i64 {
+    if (out.len > elen) { return 0; }
+    if (out.len == 0) { return 1; }
+    if (mem.core.memcmp(out.ptr, exp, out.len) != 0) { return 0; }
+    return 1;
+}
+
+// kind 0 raw, 1 gzip, 2 zlib: comp cut at about `steps` places.
+fn _cuts(kind as i64, comp as *u8, clen as i64, exp as *u8, elen as i64, steps as i64) as i64 {
+    let is i64 as step with mut = clen / steps;
+    if (step < 1) { step = 1; }
+    // gzip_decompress takes zero bytes as zero members: from one byte on.
+    let is i64 as k with mut = 0;
+    if (kind == 1) { k = 1; }
+    while (k < clen) {
+        let is bytes.Bytes as out = bytes.bytes_new(256);
+        let is i64 as r = _decode(kind, comp, k, &out);
+        let is i64 as ok with mut = _prefix(&out, exp, elen);
+        if (r >= 0 && _same(&out, exp, elen) == 0) { ok = 0; }
+        bytes.bytes_free(&out);
+        if (ok == 0) { return 1; }
+        k = k + step;
+    }
+    return 0;
+}
+
+fn _cut_fixture(name as *u8, raw_path as *u8, bin_path as *u8) as i64 {
+    io.write_str(io.STDOUT, "  cut ");
+    io.write_str(io.STDOUT, name);
+    let is i64 as clen with mut = 0;
+    let is *u8 as comp = read_whole(raw_path, &clen);
+    let is i64 as elen with mut = 0;
+    let is *u8 as exp = read_whole(bin_path, &elen);
+    if (cast(i64, comp) == 0 || cast(i64, exp) == 0) { io.write_str(io.STDOUT, " ... FAIL (read)\n"); return 1; }
+    let is i64 as b with mut = _cuts(0, comp, clen, exp, elen, 150);
+    // and wrapped, as zlib and gzip
+    let is bytes.Bytes as z = bytes.bytes_new(256);
+    let is bytes.Bytes as g = bytes.bytes_new(256);
+    if (zlib.zlib_compress(exp, elen, &z, 6) < 0) { b = b + 1; }
+    if (gzip.gzip_compress(exp, elen, &g, 6) < 0) { b = b + 1; }
+    b = b + _cuts(2, z.ptr, z.len, exp, elen, 60);
+    b = b + _cuts(1, g.ptr, g.len, exp, elen, 60);
+    bytes.bytes_free(&z);
+    bytes.bytes_free(&g);
+    if (b == 0) { io.write_str(io.STDOUT, " ... PASS\n"); } else { io.write_str(io.STDOUT, " ... FAIL\n"); }
+    return b;
+}
+
+fn suite_truncated() as i64 {
+    io.write_str(io.STDOUT, "[truncated]\n");
+    let is i64 as b with mut = 0;
+    b = b + _cut_fixture("hello",    "tests/fixtures/hello.raw",    "tests/fixtures/hello.bin");
+    b = b + _cut_fixture("abc",      "tests/fixtures/abc.raw",      "tests/fixtures/abc.bin");
+    b = b + _cut_fixture("lorem",    "tests/fixtures/lorem.raw",    "tests/fixtures/lorem.bin");
+    b = b + _cut_fixture("binall",   "tests/fixtures/binall.raw",   "tests/fixtures/binall.bin");
+    b = b + _cut_fixture("fixedlit", "tests/fixtures/fixedlit.raw", "tests/fixtures/fixedlit.bin");
+    b = b + _cut_fixture("big",      "tests/fixtures/big.raw",      "tests/fixtures/big.bin");
+    b = b + _cut_fixture("window",   "tests/fixtures/window.raw",   "tests/fixtures/window.bin");
+
+    // The stream behind the PNG that hung caustic-image: rows of noise and
+    // gradient, zlib level 6, cut to its first 1000 bytes.
+    io.write_str(io.STDOUT, "  cut image rows");
+    let is bytes.Bytes as rows = bytes.bytes_new(70000);
+    let is i64 as y with mut = 0;
+    while (y < 256) {
+        bytes.bytes_push(&rows, cast(u8, 0));
+        let is i64 as x with mut = 0;
+        while (x < 256) {
+            if (y % 2 == 0) { bytes.bytes_push(&rows, cast(u8, _trnd())); } else { bytes.bytes_push(&rows, cast(u8, x)); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is i64 as rb with mut = 0;
+    let is i64 as lv with mut = 1;
+    while (lv <= 9) {
+        let is bytes.Bytes as zc = bytes.bytes_new(1024);
+        zlib.zlib_compress(rows.ptr, rows.len, &zc, lv);
+        let is bytes.Bytes as o = bytes.bytes_new(256);
+        if (zlib.zlib_decompress(zc.ptr, 1000, &o) >= 0 || _prefix(&o, rows.ptr, rows.len) == 0) { rb = rb + 1; }
+        bytes.bytes_free(&o);
+        // whole: still right
+        let is bytes.Bytes as w = bytes.bytes_new(256);
+        if (zlib.zlib_decompress(zc.ptr, zc.len, &w) < 0 || _same(&w, rows.ptr, rows.len) == 0) { rb = rb + 1; }
+        bytes.bytes_free(&w);
+        rb = rb + _cuts(2, zc.ptr, zc.len, rows.ptr, rows.len, 80);
+        bytes.bytes_free(&zc);
+        lv = lv + 4;
+    }
+    if (rb == 0) { io.write_str(io.STDOUT, " ... PASS\n"); } else { io.write_str(io.STDOUT, " ... FAIL\n"); }
+    b = b + rb;
+    bytes.bytes_free(&rows);
+
+    // Garbage: every decode ends, and makes no more than its bits can say
+    // (a symbol takes at least one bit and makes at most 258 bytes; a
+    // stored block at most 65535 a 5-byte header).
+    io.write_str(io.STDOUT, "  garbage");
+    let is [2048]u8 as junk;
+    let is i64 as gb with mut = 0;
+    let is i64 as t with mut = 0;
+    while (t < 400) {
+        let is i64 as n = 16 + (t * 37) % 2032;
+        let is i64 as i with mut = 0;
+        while (i < n) { junk[i] = cast(u8, _trnd()); i = i + 1; }
+        // every block type first
+        junk[0] = cast(u8, (cast(i64, junk[0]) & 248) | (t % 8));
+        let is bytes.Bytes as o = bytes.bytes_new(256);
+        inflate.inflate(cast(*u8, &junk), n, &o);
+        if (o.len > n * 8 * 258 + 65535) { gb = gb + 1; }
+        bytes.bytes_free(&o);
+        t = t + 1;
+    }
+    if (gb == 0) { io.write_str(io.STDOUT, " ... PASS\n"); } else { io.write_str(io.STDOUT, " ... FAIL\n"); }
+    b = b + gb;
+    return b;
+}
+
 fn main() as i32 {
     let is i64 as bad with mut = 0;
     bad = bad + suite_core();
     bad = bad + suite_inflate();
+    bad = bad + suite_truncated();
     bad = bad + suite_gzip();
     bad = bad + suite_deflate();
     bad = bad + suite_lz4();

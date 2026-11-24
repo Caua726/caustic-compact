@@ -179,7 +179,8 @@ fn huff_decode(h as *Huff, br as *bitreader.BitReader) as i64 {
     }
     let is i64 as entry = h.fast[br.acc & ((1 << ROOT) - 1)];
     let is i64 as length = entry >> 16;
-    if (length > 0) {
+    // Only bits that came: past the input's end acc holds zeros.
+    if (length > 0 && length <= br.nbits) {
         br.acc = br.acc >> length;
         br.nbits = br.nbits - length;
         return entry & 0xFFFF;

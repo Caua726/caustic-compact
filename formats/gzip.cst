@@ -76,7 +76,11 @@ fn gzip_decompress(src as *u8, src_len as i64, out as *bytes.Bytes) as i64 {
         while (pos < src_len && cast(i64, src[pos]) == 0) { pos = pos + 1; }
         if (pos >= src_len) { break; }
         // stop cleanly if what's left is not another gzip member
-        if (pos + 2 > src_len) { break; }
+        // (one byte where the first member starts is a member cut short)
+        if (pos + 2 > src_len) {
+            if (pos == 0) { return errno.Z_BADHDR; }
+            break;
+        }
         if (cast(i64, src[pos]) != 0x1F || cast(i64, src[pos + 1]) != 0x8B) {
             if (pos == 0) { return errno.Z_BADHDR; }
             break;
